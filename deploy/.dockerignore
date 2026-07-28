@@ -1,0 +1,56 @@
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+package-lock.json
+
+# 编译输出
+dist/
+
+# 数据文件（使用挂载卷）
+data/
+backups/
+
+# 临时文件
+temp/
+*.log
+*.tmp
+
+# Git
+.git/
+.gitignore
+
+# 环境配置（使用挂载）
+.env
+env
+
+# 文档
+*.md
+docs/
+
+# Windows特定
+*.bat
+node-portable/
+compile-and-run.bat
+run.bat
+quick-install.bat
+setup-and-start.bat
+
+# 部署文件夹（避免循环）
+deploy/
+
+# 开发文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 测试文件
+test/
+*.test.js
+*.test.ts
+
+# 其他
+.DS_Store
+Thumbs.db

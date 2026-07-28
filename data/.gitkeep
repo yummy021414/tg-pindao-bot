@@ -1,0 +1,2 @@
+// 此文件确保data目录被git追踪，但data/内的文件会被.gitignore忽略
+

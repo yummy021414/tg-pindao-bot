@@ -1,0 +1,92 @@
+# ========================================
+# Telegram Bot .gitignore
+# ========================================
+
+# ==================== 敏感数据（不要上传！）====================
+env
+.env
+*.env
+
+# 数据目录（包含用户数据和媒体）
+data/
+!data/.gitkeep
+
+# Session缓存（敏感）
+*.session
+
+# 备份文件
+backups/
+
+# ==================== 编译输出 ====================
+dist/
+*.js.map
+*.d.ts
+*.d.ts.map
+
+# ==================== 依赖 ====================
+node_modules/
+package-lock.json
+npm-debug.log
+yarn-error.log
+yarn.lock
+
+# ==================== Windows特定 ====================
+node-portable/
+*.bat
+Thumbs.db
+desktop.ini
+
+# ==================== 临时文件 ====================
+temp/
+tmp/
+*.tmp
+*.log
+*.swp
+*.swo
+*~
+
+# ==================== IDE ====================
+.vscode/
+.idea/
+*.sublime-*
+
+# ==================== 系统 ====================
+.DS_Store
+*.pid
+
+# ==================== 测试文件 ====================
+test_*.js
+*.test.js
+*.test.ts
+
+# ==================== 其他项目文件 ====================
+freqtrade-develop/
+操作清单.txt
+Session登录逻辑说明.txt
+fix_summary.md
+test_fixes.md
+check_*.js
+clear_*.js
+migrate_*.js
+simple_migrate.js
+verify_*.js
+final_check.js
+emergency_stop.js
+install-deps.js
+install.js
+extract_data.py
+migrate_data.py
+
+# ==================== 部署包（不需要在git中）====================
+pindaobot-v2-deploy/
+*.zip
+*.tar.gz
+
+# ==================== 开发文档草稿 ====================
+DEPLOYMENT.md
+部署说明.txt
+开始部署.txt
+首次部署必读.md
+迁移旧数据.sh
+README_部署包.md
+README_DOCKER.md

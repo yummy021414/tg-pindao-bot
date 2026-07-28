@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  telegram-bot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    
+    container_name: pindaobot
+    restart: unless-stopped
+
+    # 网页相册端口（域名反代到 80/443 时，源头也要能访问到这个端口）
+    ports:
+      - "3000:3000"
+    
+    volumes:
+      - ../data:/app/data
+      # 必须挂文件，不能挂 env 目录
+      - ../env/.env:/app/.env:ro
+      - /etc/localtime:/etc/localtime:ro
+    
+    environment:
+      - TZ=Asia/Shanghai
+      - NODE_ENV=production
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
