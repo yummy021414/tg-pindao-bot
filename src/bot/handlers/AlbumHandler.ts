@@ -31,7 +31,7 @@ export class AlbumHandler {
   /** key = `${userId}:${groupKey}` — 按 Telegram 相册分组收齐 */
   private static albumGroupTimeouts: Map<string, NodeJS.Timeout> = new Map();
   private static albumReadyTimeouts: Map<number, NodeJS.Timeout> = new Map();
-  /** 收集进度消息（尽量编辑同一条；不行则在底部新发，成功后再删旧卡） */
+  /** 仅保留底部一条汇总卡；更新时删旧发新，不编辑上方旧消息 */
   private static albumStatusMsgId: Map<number, number> = new Map();
   private static albumStatusDebounce: Map<number, NodeJS.Timeout> = new Map();
   private static readonly GROUP_SETTLE_MS = 1600;
@@ -67,79 +67,63 @@ export class AlbumHandler {
     return (groups || []).reduce((n, g) => n + ((g.files && g.files.length) || 0), 0);
   }
 
-  private static formatAlbumCollectStatus(session: UserSession): string {
+  private static formatAlbumCollectStatus(session: UserSession, extraNote?: string): string {
     const groups = session.albumGroups || [];
     const groupCount = groups.length;
     const fileCount = this.countAlbumFiles(groups);
-    const lines = groups.slice(0, 12).map((g: any, i: number) => {
+    const lines = groups.slice(-8).map((g: any, i: number) => {
+      const idx = Math.max(0, groupCount - groups.slice(-8).length) + i + 1;
       const t = String(g.caption || '').replace(/\s+/g, ' ').trim();
       const short = t.length > 36 ? t.slice(0, 36) + '…' : t;
       const safe = short.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      return `${i + 1}. ${(g.files || []).length}个文件 — <i>${safe || '(无文案)'}</i>`;
+      return `${idx}. ${(g.files || []).length}个文件 — <i>${safe || '(无文案)'}</i>`;
     });
-    const more = groups.length > 12 ? `\n…共 ${groupCount} 组` : '';
-    return (
-      `📦 <b>资料已收到</b>\n` +
-      `📊 共 <b>${groupCount}</b> 组 / <b>${fileCount}</b> 个文件（上限 ${MAX_GROUPS} 组）\n\n` +
-      `<b>各组：</b>\n${lines.join('\n')}${more}\n\n` +
-      `可继续再发，或点下方按钮。`
-    );
+    const more = groupCount > 8 ? `\n…前面还有 ${groupCount - 8} 组` : '';
+    let text =
+      `✅ <b>已收录 ${groupCount} 组</b>（共 ${fileCount} 个文件，上限 ${MAX_GROUPS} 组）\n\n` +
+      `<b>最近各组：</b>\n${lines.join('\n')}${more}\n\n` +
+      `可继续发关键词或图片；点下方「完成生成」出链接。`;
+    if (extraNote) text += `\n\n${extraNote}`;
+    return text;
   }
 
   /**
-   * 更新收集进度：优先编辑上一条汇总；编辑失败则在底部新发（成功后再删旧卡，避免「先删没反馈」）。
+   * 底部只留一条汇总：新发成功后再删上一条（不编辑旧卡，避免卡片堆在上面要爬楼）。
    */
   private static async upsertAlbumCollectStatus(
     telegram: any,
     chatId: number,
     userId: number,
-    session: UserSession
+    session: UserSession,
+    extraNote?: string
   ): Promise<void> {
-    const text = this.formatAlbumCollectStatus(session);
+    const text = this.formatAlbumCollectStatus(session, extraNote);
     const markup = Markup.inlineKeyboard([
       [
         Markup.button.callback('✅ 完成生成', 'finish_album'),
         Markup.button.callback('❌ 取消', 'cancel_album_maker')
       ]
     ]);
-    const replyMarkup = markup.reply_markup;
     const oldId = this.albumStatusMsgId.get(userId);
-
-    if (oldId) {
-      try {
-        await telegram.editMessageText(chatId, oldId, undefined, text, {
-          parse_mode: 'HTML',
-          reply_markup: replyMarkup
-        });
-        console.log(
-          `[相册] 汇总已更新(编辑) 用户=${userId} 组=${(session.albumGroups || []).length} 文件=${this.countAlbumFiles(session.albumGroups || [])}`
-        );
-        return;
-      } catch (e: any) {
-        const msg = String(e?.message || e);
-        if (msg.includes('message is not modified')) return;
-        // 消息太靠上/无法编辑 → 底部新发
-      }
-    }
 
     try {
       const sent = await telegram.sendMessage(chatId, text, {
         parse_mode: 'HTML',
-        reply_markup: replyMarkup
+        reply_markup: markup.reply_markup
       });
-      if (sent?.message_id) {
-        if (oldId) {
-          try {
-            await telegram.deleteMessage(chatId, oldId);
-          } catch {
-            // 旧卡删不掉就留着，至少新反馈在底部
-          }
+      if (!sent?.message_id) return;
+
+      if (oldId && oldId !== sent.message_id) {
+        try {
+          await telegram.deleteMessage(chatId, oldId);
+        } catch {
+          // 旧卡删失败也不影响，新卡已在底部
         }
-        this.albumStatusMsgId.set(userId, sent.message_id);
-        console.log(
-          `[相册] 汇总已更新(新发) 用户=${userId} 组=${(session.albumGroups || []).length} 文件=${this.countAlbumFiles(session.albumGroups || [])}`
-        );
       }
+      this.albumStatusMsgId.set(userId, sent.message_id);
+      console.log(
+        `[相册] 汇总已更新(底部单卡) 用户=${userId} 组=${(session.albumGroups || []).length} 文件=${this.countAlbumFiles(session.albumGroups || [])}`
+      );
     } catch (e: any) {
       console.error('[相册] 发送收集进度失败:', e?.message || e);
     }
@@ -349,10 +333,16 @@ export class AlbumHandler {
     if (!session.albumGroups) session.albumGroups = [];
 
     if (session.albumGroups.length >= MAX_GROUPS) {
-      await ctx.reply(`⚠️ 单次相册最多 ${MAX_GROUPS} 组，请点击“完成生成”。`, Markup.inlineKeyboard([
-        [Markup.button.callback('✅ 完成生成', 'finish_album')],
-        [Markup.button.callback('❌ 退出', 'cancel_album_maker')]
-      ]));
+      const kwChatId = ctx.chat?.id;
+      if (kwChatId) {
+        await this.upsertAlbumCollectStatus(
+          ctx.telegram,
+          kwChatId,
+          userId,
+          session,
+          `⚠️ 已达 ${MAX_GROUPS} 组上限，请点「完成生成」。`
+        );
+      }
       return;
     }
 
@@ -398,19 +388,16 @@ export class AlbumHandler {
     await db.saveUserSession(userId, session);
 
     const chatId = ctx.chat?.id;
-    if (chatId) {
-      this.scheduleAlbumCollectStatus(ctx.telegram, chatId, userId, userSessions, db);
-    }
-
-    let msg = `✅ 已从资料库添加 "${keyword}" 的 ${added} 组资料。\n📊 当前 ${session.albumGroups.length}/${MAX_GROUPS} 组\n\n可继续发送关键词或图片，或点下方「完成生成」。`;
+    let extraNote: string | undefined;
     if (batchIds.length > added) {
-      msg += `\n⚠️ 资料共 ${batchIds.length} 组，已达上限，仅加入前 ${added} 组。`;
+      extraNote = `⚠️ 「${keyword}」共 ${batchIds.length} 组，已达上限，仅加入 ${added} 组。`;
+    } else if (added > 0) {
+      extraNote = `💡 刚从资料库加入「${keyword}」${added} 组。`;
     }
 
-    await ctx.reply(msg, Markup.inlineKeyboard([
-      [Markup.button.callback('✅ 完成生成', 'finish_album')],
-      [Markup.button.callback('❌ 退出', 'cancel_album_maker')]
-    ]));
+    if (chatId) {
+      await this.upsertAlbumCollectStatus(ctx.telegram, chatId, userId, session, extraNote);
+    }
   }
 
   static async handleMediaMessage(ctx: Context, mediaType: string, userSessions: Map<number, UserSession>, db: any): Promise<void> {
@@ -426,10 +413,13 @@ export class AlbumHandler {
 
     // 已满 20 组且当前没有进行中的待分批，拒绝新资料
     if (session.albumGroups.length >= MAX_GROUPS && session.pendingAlbumMedia.length === 0) {
-      await ctx.reply(`⚠️ 单次相册最多 ${MAX_GROUPS} 组资料，请点击“完成生成”。`, Markup.inlineKeyboard([
-        [Markup.button.callback('✅ 完成生成', 'finish_album')],
-        [Markup.button.callback('❌ 退出', 'cancel_album_maker')]
-      ]));
+      await this.upsertAlbumCollectStatus(
+        ctx.telegram,
+        chatId,
+        userId,
+        session,
+        `⚠️ 已达 ${MAX_GROUPS} 组上限，请点「完成生成」。`
+      );
       return;
     }
 
