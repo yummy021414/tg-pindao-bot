@@ -7,6 +7,7 @@ import path from 'path';
 import { BotMode, UserSession } from '../../types';
 import { v4 as uuidv4 } from 'uuid';
 import { config, isAdminUser, isSuperAdmin } from '../../config';
+import { SearchHandler } from './SearchHandler';
 import https from 'https';
 import axios from 'axios';
 
@@ -34,6 +35,10 @@ export class AlbumHandler {
   /** 仅保留底部一条汇总卡；更新时删旧发新，不编辑上方旧消息 */
   private static albumStatusMsgId: Map<number, number> = new Map();
   private static albumStatusDebounce: Map<number, NodeJS.Timeout> = new Map();
+  /** 连发关键词时串行入队，避免并发改 session 丢组 */
+  private static albumKeywordChain: Map<number, Promise<void>> = new Map();
+  /** 防抖汇总前暂存提示（未找到/刚加入等） */
+  private static albumStatusPendingNote: Map<number, string> = new Map();
   private static readonly GROUP_SETTLE_MS = 1600;
   /** 停手后再汇总一次（主要给最后一组 pending 收尾） */
   private static readonly READY_MS = 2500;
@@ -71,6 +76,15 @@ export class AlbumHandler {
     const groups = session.albumGroups || [];
     const groupCount = groups.length;
     const fileCount = this.countAlbumFiles(groups);
+
+    if (groupCount === 0) {
+      return (
+        `📭 <b>暂未收录资料</b>（上限 ${MAX_GROUPS} 组）\n\n` +
+        `${extraNote || '请发送关键词或图片。'}\n\n` +
+        `可连续连发关键词（与搜索/发布相同）；底部会更新进度。`
+      );
+    }
+
     const lines = groups.slice(-8).map((g: any, i: number) => {
       const idx = Math.max(0, groupCount - groups.slice(-8).length) + i + 1;
       const t = String(g.caption || '').replace(/\s+/g, ' ').trim();
@@ -129,14 +143,16 @@ export class AlbumHandler {
     }
   }
 
-  /** 每组入册后防抖刷新进度（连甩多组时合并成一条，不会刷屏） */
+  /** 每组入册后防抖刷新进度（连发关键词/多组图时合并成底部一条） */
   private static scheduleAlbumCollectStatus(
     telegram: any,
     chatId: number,
     userId: number,
     userSessions: Map<number, UserSession>,
-    db: any
+    db: any,
+    extraNote?: string
   ): void {
+    if (extraNote) this.appendAlbumStatusNote(userId, extraNote);
     const existing = this.albumStatusDebounce.get(userId);
     if (existing) clearTimeout(existing);
     const timer = setTimeout(async () => {
@@ -144,14 +160,72 @@ export class AlbumHandler {
       try {
         const session = userSessions.get(userId) || await db.getUserSession(userId);
         if (!session || session.mode !== BotMode.AlbumMaker) return;
-        if (!(session.albumGroups && session.albumGroups.length > 0)) return;
+        const note = this.albumStatusPendingNote.get(userId);
+        this.albumStatusPendingNote.delete(userId);
+        const groupCount = session.albumGroups?.length || 0;
+        if (groupCount === 0 && !note) return;
         userSessions.set(userId, session);
-        await this.upsertAlbumCollectStatus(telegram, chatId, userId, session);
+        await this.upsertAlbumCollectStatus(telegram, chatId, userId, session, note);
       } catch (err: any) {
         console.error('[相册] 防抖汇总失败:', err?.message || err);
       }
-    }, 800);
+    }, 600);
     this.albumStatusDebounce.set(userId, timer);
+  }
+
+  private static appendAlbumStatusNote(userId: number, note: string): void {
+    const prev = this.albumStatusPendingNote.get(userId);
+    this.albumStatusPendingNote.set(userId, prev ? `${prev}\n${note}` : note);
+  }
+
+  /** 关键词连发：排队处理，不阻塞收下一条消息 */
+  private static runAlbumKeywordSerial(userId: number, task: () => Promise<void>): void {
+    const prev = this.albumKeywordChain.get(userId) || Promise.resolve();
+    const next = prev.catch(() => {}).then(task);
+    this.albumKeywordChain.set(userId, next);
+    void next.finally(() => {
+      if (this.albumKeywordChain.get(userId) === next) {
+        this.albumKeywordChain.delete(userId);
+      }
+    });
+  }
+
+  private static resolveAlbumScopeUserId(userId: number): number | undefined {
+    if (isSuperAdmin(userId)) return undefined;
+    if (isAdminUser(userId)) return userId;
+    return config.superAdminId;
+  }
+
+  private static addKeywordBatchesToAlbum(
+    session: UserSession,
+    keyword: string,
+    mediaItems: any[]
+  ): { added: number; totalBatches: number } {
+    const batches: { [key: string]: any[] } = {};
+    mediaItems.forEach((m: any) => {
+      const bId = m.batchId || 'legacy';
+      if (!batches[bId]) batches[bId] = [];
+      batches[bId].push(m);
+    });
+
+    const batchIds = Object.keys(batches);
+    let added = 0;
+    for (let i = 0; i < batchIds.length; i++) {
+      if ((session.albumGroups || []).length >= MAX_GROUPS) break;
+      const batchItems = batches[batchIds[i]];
+      const mainCaption = batchItems.find((m: any) => m.caption)?.caption || `${keyword} 资料包`;
+      if (!session.albumGroups) session.albumGroups = [];
+      session.albumGroups.push({
+        id: `group_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 6)}`,
+        caption: mainCaption,
+        files: batchItems.map((m: any) => ({
+          id: m.file_id,
+          type: m.file_type === 'photo' ? 'photo' : 'video'
+        }))
+      } as any);
+      added++;
+    }
+    return { added, totalBatches: batchIds.length };
   }
 
   // 全局下载槽位：多人同时做相册时，限制总并发，避免把线路打爆；数据仍按人隔离不会串
@@ -221,6 +295,8 @@ export class AlbumHandler {
   static clearAlbumSessionState(userId: number): void {
     this.clearAlbumTimers(userId);
     this.albumStatusMsgId.delete(userId);
+    this.albumStatusPendingNote.delete(userId);
+    this.albumKeywordChain.delete(userId);
   }
 
   static async handleStart(ctx: Context, db: any): Promise<void> {
@@ -305,11 +381,11 @@ export class AlbumHandler {
     await ctx.reply(
       `✅ 已设置相册名称：<b>${text}</b>\n\n` +
       '现在请开始发送资料：\n' +
-      '1️⃣ <b>发送关键词</b>：从资料库同步（自动成组）\n' +
+      '1️⃣ <b>发送关键词</b>：从资料库同步（与搜索/发布相同，可连写、空格分隔、连续连发）\n' +
       '2️⃣ <b>直接发送照片/视频</b>：手动分批制作\n\n' +
       '💡 <b>制作规则</b>：\n' +
-      '• 每发一组资料，约 1～2 秒后会更新「已收录几组」进度（在聊天底部）。\n' +
-      '• 可连续甩多组，按 Telegram 相册自动分组。\n' +
+      '• 关键词示例：优米樊樊 / 优米 樊樊 / 一行连发多个词\n' +
+      '• 可连续快速发送，底部会更新「已收录 N 组」\n' +
       `• 单次最多 <b>${MAX_GROUPS}</b> 组资料。\n` +
       '• 点下方「完成生成」即可出链接；相册 3 天后自动清除。',
       {
@@ -322,82 +398,79 @@ export class AlbumHandler {
     );
   }
 
-  /** 从资料库按关键词同步到相册（生成时再本地下载） */
-  static async handleKeyword(ctx: Context, db: any, userSessions: Map<number, UserSession>, keyword: string): Promise<void> {
+  /** 从资料库按关键词同步到相册（支持连写/空格/连续连发，逻辑同搜索发布） */
+  static async handleKeyword(ctx: Context, db: any, userSessions: Map<number, UserSession>, rawInput: string): Promise<void> {
     const userId = ctx.from?.id;
-    if (!userId) return;
+    const chatId = ctx.chat?.id;
+    if (!userId || !chatId) return;
 
+    // 不 await 整条链路，避免连发时被 Telegram API 卡住
+    this.runAlbumKeywordSerial(userId, () =>
+      this.processAlbumKeywords(ctx, db, userSessions, rawInput, userId, chatId)
+    );
+  }
+
+  private static async processAlbumKeywords(
+    ctx: Context,
+    db: any,
+    userSessions: Map<number, UserSession>,
+    rawInput: string,
+    userId: number,
+    chatId: number
+  ): Promise<void> {
     const session = userSessions.get(userId) || await db.getUserSession(userId);
     if (!session || session.mode !== BotMode.AlbumMaker) return;
 
     if (!session.albumGroups) session.albumGroups = [];
 
     if (session.albumGroups.length >= MAX_GROUPS) {
-      const kwChatId = ctx.chat?.id;
-      if (kwChatId) {
-        await this.upsertAlbumCollectStatus(
-          ctx.telegram,
-          kwChatId,
-          userId,
-          session,
-          `⚠️ 已达 ${MAX_GROUPS} 组上限，请点「完成生成」。`
-        );
+      this.scheduleAlbumCollectStatus(
+        ctx.telegram, chatId, userId, userSessions, db,
+        `⚠️ 已达 ${MAX_GROUPS} 组上限，请点「完成生成」。`
+      );
+      return;
+    }
+
+    const scopeUserId = this.resolveAlbumScopeUserId(userId);
+    const knownKeywords = await db.getAllKeywords(scopeUserId);
+    let keywords = SearchHandler.parseSearchKeywords(rawInput, knownKeywords);
+    if (keywords.length === 0) {
+      keywords = [rawInput.trim()].filter(Boolean);
+    }
+
+    const notes: string[] = [];
+    let anyAdded = false;
+
+    for (const kw of keywords) {
+      if ((session.albumGroups || []).length >= MAX_GROUPS) {
+        notes.push(`⚠️ 已达 ${MAX_GROUPS} 组上限，后续关键词已跳过。`);
+        break;
       }
-      return;
-    }
 
-    // 与搜索一致：超管全库，子管理员自己的库，普通用户公共库
-    let scopeUserId: number | undefined = config.superAdminId;
-    if (isSuperAdmin(userId)) scopeUserId = undefined;
-    else if (isAdminUser(userId)) scopeUserId = userId;
+      const mediaItems = await db.getMediaByKeyword(kw, scopeUserId);
+      if (mediaItems.length === 0) {
+        notes.push(`❌ 未找到「${kw}」`);
+        continue;
+      }
 
-    const mediaItems = await db.getMediaByKeyword(keyword, scopeUserId);
-    if (mediaItems.length === 0) {
-      await ctx.reply(`❌ 资料库未找到关键词 "${keyword}" 的资料。`);
-      return;
-    }
-
-    const batches: { [key: string]: any[] } = {};
-    mediaItems.forEach((m: any) => {
-      const bId = m.batchId || 'legacy';
-      if (!batches[bId]) batches[bId] = [];
-      batches[bId].push(m);
-    });
-
-    const batchIds = Object.keys(batches);
-    let added = 0;
-
-    for (let i = 0; i < batchIds.length; i++) {
-      if (session.albumGroups.length >= MAX_GROUPS) break;
-
-      const batchItems = batches[batchIds[i]];
-      const mainCaption = batchItems.find((m: any) => m.caption)?.caption || `${keyword} 资料包`;
-
-      session.albumGroups.push({
-        id: `group_${Date.now()}_${i}`,
-        caption: mainCaption,
-        files: batchItems.map((m: any) => ({
-          id: m.file_id,
-          type: m.file_type === 'photo' ? 'photo' : 'video'
-        }))
-      } as any);
-      added++;
+      const { added, totalBatches } = this.addKeywordBatchesToAlbum(session, kw, mediaItems);
+      if (added > 0) {
+        anyAdded = true;
+        notes.push(`✅ 「${kw}」+${added} 组`);
+      }
+      if (totalBatches > added) {
+        notes.push(`⚠️ 「${kw}」共 ${totalBatches} 组，仅加入 ${added} 组（上限）`);
+      }
     }
 
     userSessions.set(userId, session);
     await db.saveUserSession(userId, session);
 
-    const chatId = ctx.chat?.id;
-    let extraNote: string | undefined;
-    if (batchIds.length > added) {
-      extraNote = `⚠️ 「${keyword}」共 ${batchIds.length} 组，已达上限，仅加入 ${added} 组。`;
-    } else if (added > 0) {
-      extraNote = `💡 刚从资料库加入「${keyword}」${added} 组。`;
-    }
+    const summary = notes.length > 0
+      ? notes.join('\n')
+      : (anyAdded ? undefined : `❌ 输入「${rawInput.trim()}」未匹配到资料`);
 
-    if (chatId) {
-      await this.upsertAlbumCollectStatus(ctx.telegram, chatId, userId, session, extraNote);
-    }
+    this.scheduleAlbumCollectStatus(ctx.telegram, chatId, userId, userSessions, db, summary);
   }
 
   static async handleMediaMessage(ctx: Context, mediaType: string, userSessions: Map<number, UserSession>, db: any): Promise<void> {
