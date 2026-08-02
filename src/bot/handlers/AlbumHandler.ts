@@ -31,11 +31,12 @@ export class AlbumHandler {
   /** key = `${userId}:${groupKey}` — 按 Telegram 相册分组收齐 */
   private static albumGroupTimeouts: Map<string, NodeJS.Timeout> = new Map();
   private static albumReadyTimeouts: Map<number, NodeJS.Timeout> = new Map();
-  /** 收集进度消息（编辑同一条，避免刷屏） */
+  /** 收集进度消息（尽量编辑同一条；不行则在底部新发，成功后再删旧卡） */
   private static albumStatusMsgId: Map<number, number> = new Map();
+  private static albumStatusDebounce: Map<number, NodeJS.Timeout> = new Map();
   private static readonly GROUP_SETTLE_MS = 1600;
-  /** 连续甩多组时：最后一条媒体后静默这么久，再汇总一次（不中途刷屏） */
-  private static readonly READY_MS = 3500;
+  /** 停手后再汇总一次（主要给最后一组 pending 收尾） */
+  private static readonly READY_MS = 2500;
   private static httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
   private static clearAlbumTimers(userId: number): void {
@@ -54,6 +55,11 @@ export class AlbumHandler {
         clearTimeout(this.albumGroupTimeouts.get(key)!);
         this.albumGroupTimeouts.delete(key);
       }
+    }
+    const deb = this.albumStatusDebounce.get(userId);
+    if (deb) {
+      clearTimeout(deb);
+      this.albumStatusDebounce.delete(userId);
     }
   }
 
@@ -81,8 +87,7 @@ export class AlbumHandler {
   }
 
   /**
-   * 停手汇总：始终在聊天底部新发一条（不编辑上方旧消息）。
-   * 否则用户继续往下发图后，只改了上面的旧卡片，看起来像「没有后续反馈」。
+   * 更新收集进度：优先编辑上一条汇总；编辑失败则在底部新发（成功后再删旧卡，避免「先删没反馈」）。
    */
   private static async upsertAlbumCollectStatus(
     telegram: any,
@@ -97,30 +102,72 @@ export class AlbumHandler {
         Markup.button.callback('❌ 取消', 'cancel_album_maker')
       ]
     ]);
-
-    // 尽量删掉上一条汇总，避免一堆重复卡片
+    const replyMarkup = markup.reply_markup;
     const oldId = this.albumStatusMsgId.get(userId);
+
     if (oldId) {
       try {
-        await telegram.deleteMessage(chatId, oldId);
-      } catch {
-        // 删不掉就留着，不影响新发
+        await telegram.editMessageText(chatId, oldId, undefined, text, {
+          parse_mode: 'HTML',
+          reply_markup: replyMarkup
+        });
+        console.log(
+          `[相册] 汇总已更新(编辑) 用户=${userId} 组=${(session.albumGroups || []).length} 文件=${this.countAlbumFiles(session.albumGroups || [])}`
+        );
+        return;
+      } catch (e: any) {
+        const msg = String(e?.message || e);
+        if (msg.includes('message is not modified')) return;
+        // 消息太靠上/无法编辑 → 底部新发
       }
-      this.albumStatusMsgId.delete(userId);
     }
 
     try {
       const sent = await telegram.sendMessage(chatId, text, {
         parse_mode: 'HTML',
-        ...markup
+        reply_markup: replyMarkup
       });
-      if (sent?.message_id) this.albumStatusMsgId.set(userId, sent.message_id);
-      console.log(
-        `[相册] 汇总反馈已发送 用户=${userId} 组=${(session.albumGroups || []).length} 文件=${this.countAlbumFiles(session.albumGroups || [])}`
-      );
+      if (sent?.message_id) {
+        if (oldId) {
+          try {
+            await telegram.deleteMessage(chatId, oldId);
+          } catch {
+            // 旧卡删不掉就留着，至少新反馈在底部
+          }
+        }
+        this.albumStatusMsgId.set(userId, sent.message_id);
+        console.log(
+          `[相册] 汇总已更新(新发) 用户=${userId} 组=${(session.albumGroups || []).length} 文件=${this.countAlbumFiles(session.albumGroups || [])}`
+        );
+      }
     } catch (e: any) {
       console.error('[相册] 发送收集进度失败:', e?.message || e);
     }
+  }
+
+  /** 每组入册后防抖刷新进度（连甩多组时合并成一条，不会刷屏） */
+  private static scheduleAlbumCollectStatus(
+    telegram: any,
+    chatId: number,
+    userId: number,
+    userSessions: Map<number, UserSession>,
+    db: any
+  ): void {
+    const existing = this.albumStatusDebounce.get(userId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(async () => {
+      this.albumStatusDebounce.delete(userId);
+      try {
+        const session = userSessions.get(userId) || await db.getUserSession(userId);
+        if (!session || session.mode !== BotMode.AlbumMaker) return;
+        if (!(session.albumGroups && session.albumGroups.length > 0)) return;
+        userSessions.set(userId, session);
+        await this.upsertAlbumCollectStatus(telegram, chatId, userId, session);
+      } catch (err: any) {
+        console.error('[相册] 防抖汇总失败:', err?.message || err);
+      }
+    }, 800);
+    this.albumStatusDebounce.set(userId, timer);
   }
 
   // 全局下载槽位：多人同时做相册时，限制总并发，避免把线路打爆；数据仍按人隔离不会串
@@ -185,6 +232,11 @@ export class AlbumHandler {
       flushed++;
     }
     return flushed;
+  }
+
+  static clearAlbumSessionState(userId: number): void {
+    this.clearAlbumTimers(userId);
+    this.albumStatusMsgId.delete(userId);
   }
 
   static async handleStart(ctx: Context, db: any): Promise<void> {
@@ -272,9 +324,10 @@ export class AlbumHandler {
       '1️⃣ <b>发送关键词</b>：从资料库同步（自动成组）\n' +
       '2️⃣ <b>直接发送照片/视频</b>：手动分批制作\n\n' +
       '💡 <b>制作规则</b>：\n' +
-      '• 可连续甩多组相册，按 Telegram 相册自动分组，无需等 5 秒。\n' +
+      '• 每发一组资料，约 1～2 秒后会更新「已收录几组」进度（在聊天底部）。\n' +
+      '• 可连续甩多组，按 Telegram 相册自动分组。\n' +
       `• 单次最多 <b>${MAX_GROUPS}</b> 组资料。\n` +
-      '• 生成时会下载到本地；相册 3 天后自动清除。',
+      '• 点下方「完成生成」即可出链接；相册 3 天后自动清除。',
       {
         parse_mode: 'HTML',
         ...Markup.inlineKeyboard([
@@ -344,7 +397,12 @@ export class AlbumHandler {
     userSessions.set(userId, session);
     await db.saveUserSession(userId, session);
 
-    let msg = `✅ 已从资料库添加 "${keyword}" 的 ${added} 组资料。\n📊 当前 ${session.albumGroups.length}/${MAX_GROUPS} 组\n\n可继续发送关键词或图片，或点击“完成生成”。`;
+    const chatId = ctx.chat?.id;
+    if (chatId) {
+      this.scheduleAlbumCollectStatus(ctx.telegram, chatId, userId, userSessions, db);
+    }
+
+    let msg = `✅ 已从资料库添加 "${keyword}" 的 ${added} 组资料。\n📊 当前 ${session.albumGroups.length}/${MAX_GROUPS} 组\n\n可继续发送关键词或图片，或点下方「完成生成」。`;
     if (batchIds.length > added) {
       msg += `\n⚠️ 资料共 ${batchIds.length} 组，已达上限，仅加入前 ${added} 组。`;
     }
@@ -422,21 +480,20 @@ export class AlbumHandler {
         userSessions.set(userId, currentSession);
         await db.saveUserSession(userId, currentSession);
         console.log(`📦 [相册分组] 用户 ${userId} 组 ${groupKey} 已入册，当前 ${currentSession.albumGroups.length}/${MAX_GROUPS}`);
-        // 连发中不刷进度，等停手 READY_MS 再汇总
+        this.scheduleAlbumCollectStatus(ctx.telegram, chatId, userId, userSessions, db);
       } catch (err: any) {
         console.error(`[相册模式] ❌ 分组打包失败:`, err.message);
       }
     }, this.GROUP_SETTLE_MS);
     this.albumGroupTimeouts.set(groupTimerKey, groupTimer);
 
-    // 连续发多组时不断重置；停手约 3.5 秒后只反馈一次：几组/几个文件 + 按钮
+    // 停手后再汇总一次，确保最后一组 pending 也进册且底部有「完成生成」按钮
     const existingReady = this.albumReadyTimeouts.get(userId);
     if (existingReady) clearTimeout(existingReady);
     const readyTimer = setTimeout(async () => {
       this.albumReadyTimeouts.delete(userId);
       try {
-        // 稍等组定时器收尾，避免刚停手时最后一组还在 pending
-        await new Promise(r => setTimeout(r, 400));
+        await new Promise(r => setTimeout(r, this.GROUP_SETTLE_MS + 200));
         let currentSession = userSessions.get(userId) || await db.getUserSession(userId);
         if (!currentSession || currentSession.mode !== BotMode.AlbumMaker) {
           console.warn(`[相册] 汇总跳过：会话无效或已退出 mode=${currentSession?.mode}`);
@@ -448,8 +505,12 @@ export class AlbumHandler {
           await db.saveUserSession(userId, currentSession);
         }
         if (!(currentSession.albumGroups && currentSession.albumGroups.length > 0)) return;
-        // 确保内存会话与最新组数一致
-        if (userSessions) userSessions.set(userId, currentSession);
+        userSessions.set(userId, currentSession);
+        const deb = this.albumStatusDebounce.get(userId);
+        if (deb) {
+          clearTimeout(deb);
+          this.albumStatusDebounce.delete(userId);
+        }
         await this.upsertAlbumCollectStatus(ctx.telegram, chatId, userId, currentSession);
       } catch (err: any) {
         console.error(`[相册模式] ❌ 汇总提示失败:`, err.message);

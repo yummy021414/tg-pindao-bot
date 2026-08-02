@@ -4776,7 +4776,7 @@ export class TelegramBot {
     const userId = ctx.from?.id;
     if (!userId) return;
     
-    // 彻底清理内存和磁盘
+    AlbumHandler.clearAlbumSessionState(userId);
     this.userSessions.delete(userId);
     await database.clearUserSession(userId);
     
