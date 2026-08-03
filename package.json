@@ -1,7 +1,7 @@
 {
   "name": "telegram-channel-bot",
   "version": "1.0.0",
-  "description": "Telegram频道机器人",
+  "description": "Telegram 频道资料管理机器人：关键词上传/搜索/发布、网页相册、金库备份换 Token，支持 Docker 部署",
   "main": "dist/index.js",
   "scripts": {
     "start": "node dist/index.js",

@@ -1,27 +1,55 @@
-# PindaoBot
+# PindaoBot · Telegram 频道资料机器人
 
-Telegram 资料管理机器人：上传、搜索、发布到频道，可选网页相册。
+一款开源的 **Telegram 资料管理与分发机器人**，适合频道运营、私域资料整理、关键词检索与批量发布。
 
-## 功能
+支持：**上传资料 → 关键词搜索 → 发布到频道 → 网页相册分享**，并提供 **金库备份**，方便更换 Bot Token 后迁移媒体。
 
-- 按关键词上传 / 搜索资料（图、视频、文档等）
-- 发布到指定频道（支持多关键词连发）
-- 频道管理、按钮制作、群发、网页相册
-- 金库备份：换 Bot Token 时迁移媒体 `file_id`
+---
+
+## 主要功能
+
+| 模块 | 说明 |
+|------|------|
+| 📤 资料上传 | 按关键词上传图片、视频、文档等，自动分批成组 |
+| 🔍 关键词搜索 | 支持连写、空格分隔、多词连搜（如 `优米樊樊` / `优米 樊樊`） |
+| 📢 内容发布 | 一键发布到指定频道，多关键词按顺序串行发布 |
+| 🖼️ 网页相册 | 从资料库或手动发图制作网页链接，可连续收录多组 |
+| 📡 频道管理 | 在线添加/删除频道，无需重启 |
+| 🔘 按钮制作 | 为文案/媒体添加 URL 按钮 |
+| 📣 群发消息 | 向使用过机器人的用户群发 |
+| 🗄️ 金库备份 | 媒体备份到指定频道，换 Token 后自动认领 `file_id` |
+| 🐳 Docker 部署 | 提供完整 Docker Compose 配置，适合 Linux 服务器 |
+
+---
+
+## 适用场景
+
+- Telegram 频道资料更新与分发  
+- 按关键词快速查找、发送资料包  
+- 制作可分享的网页相册链接  
+- 多频道、多管理员协作运营  
+
+---
 
 ## 环境要求
 
-- Node.js 18+
-- 或 Docker
+- **Node.js 18+**（本地开发）
+- 或 **Docker 20+**（生产部署推荐）
+- 可访问 Telegram API 的网络环境
 
-## 快速开始
+---
+
+## 快速开始（本地）
 
 ```bash
+git clone https://github.com/yummy021414/tg-pindao-bot.git
+cd tg-pindao-bot
+
 npm install
 cp .env.example .env
 # 编辑 .env，填入 BOT_TOKEN、SUPER_ADMIN_ID、CHANNEL_IDS 等
 
-npm run dev          # 开发
+npm run dev          # 开发模式
 # 或
 npm run build && npm start
 ```
@@ -30,40 +58,67 @@ npm run build && npm start
 
 | 变量 | 说明 |
 |------|------|
-| `BOT_TOKEN` | BotFather 的 Token |
+| `BOT_TOKEN` | BotFather 创建的机器人 Token |
 | `SUPER_ADMIN_ID` | 超级管理员的 Telegram 数字 ID |
-| `CHANNEL_IDS` | 频道 ID，多个用逗号分隔 |
-| `PERSISTENT_CHANNEL_ID` | 备份金库频道（换 Token 用，建议填） |
-| `DOMAIN` | 网页相册域名，如 `http://你的域名:3000` |
+| `CHANNEL_IDS` | 绑定频道 ID，多个用英文逗号分隔 |
+| `PERSISTENT_CHANNEL_ID` | 金库备份频道（换 Token 强烈建议配置） |
+| `DOMAIN` | 网页相册访问地址，如 `http://你的域名:3000` |
 
-## Docker 部署
+> ⚠️ 请勿将 `.env` 和 `data/` 提交到 Git，其中包含密钥与用户数据。
+
+---
+
+## Docker 部署（推荐）
 
 ```bash
 cd deploy
-cp env.example .env   # 填好配置
+cp env.example .env    # 填写真实配置
 docker compose up -d --build
 docker logs -f pindaobot
 ```
 
-## 换 Bot（金库）
+更新代码后：
 
-1. `npm run vault:status` — 看覆盖率  
-2. `npm run vault:sync` — 旧 Token 同步到金库  
-3. `npm run vault:claim` — 用新 Token 认领 `file_id`  
-4. 把 `.env` 里的 `BOT_TOKEN` 换成新 Token，重启  
-
-认领前需配置 `NEW_BOT_TOKEN`、`CLAIM_TO_CHAT_ID`，并先给新 Bot 发过 `/start`。
-
-## 目录说明
-
-```
-src/          源码
-scripts/      金库等脚本
-deploy/       Docker 部署
-data/         运行数据（勿提交 Git）
-.env          密钥（勿提交 Git）
+```bash
+cd /root/pindaobot          # 你的项目目录
+git pull origin main
+cd deploy
+docker compose up -d --build --force-recreate
 ```
 
-## 许可证
+---
 
-MIT
+## 换 Bot Token（金库流程）
+
+1. `npm run vault:status` — 查看备份覆盖率  
+2. `npm run vault:sync` — 用**旧 Token** 把媒体同步到金库频道  
+3. `npm run vault:claim` — 用**新 Token** 认领新的 `file_id`  
+4. 将 `.env` 中 `BOT_TOKEN` 换成新 Token，重启服务  
+
+认领前需配置 `NEW_BOT_TOKEN`、`CLAIM_TO_CHAT_ID`，并先给新 Bot 发送 `/start`。
+
+---
+
+## 项目结构
+
+```
+src/          机器人核心源码（Bot、Handler、数据库、网页服务）
+scripts/      运维脚本（金库 sync/claim/status 等）
+deploy/       Docker 部署文件
+data/         运行数据（本地生成，不纳入 Git）
+.env          环境变量（本地配置，不纳入 Git）
+```
+
+---
+
+## 技术栈
+
+- Node.js · TypeScript · Telegraf · Express  
+- JSON 文件数据库（轻量、易备份）  
+- Docker · docker-compose  
+
+---
+
+## 开源协议
+
+MIT License · 欢迎 Fork 与 Issue
