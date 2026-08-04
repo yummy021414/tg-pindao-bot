@@ -72,11 +72,51 @@ export class AlbumHandler {
     return (groups || []).reduce((n, g) => n + ((g.files && g.files.length) || 0), 0);
   }
 
+  /** 资料 caption 里可能有非法 UTF-16/控制字符，Telegram 会报 text must be encoded in UTF-8 */
+  private static sanitizeTelegramText(text: string): string {
+    if (text == null) return '';
+    const out: string[] = [];
+    const s = String(text);
+    for (let i = 0; i < s.length; i++) {
+      const code = s.charCodeAt(i);
+      if (code >= 0xd800 && code <= 0xdbff) {
+        if (i + 1 < s.length) {
+          const next = s.charCodeAt(i + 1);
+          if (next >= 0xdc00 && next <= 0xdfff) {
+            out.push(s[i], s[i + 1]);
+            i++;
+            continue;
+          }
+        }
+        continue;
+      }
+      if (code >= 0xdc00 && code <= 0xdfff) continue;
+      if (code === 0) continue;
+      if (code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) continue;
+      if (code === 0x7f) continue;
+      out.push(s[i]);
+    }
+    let result = out.join('');
+    result = Buffer.from(result, 'utf8').toString('utf8');
+    if (result.length > 3900) result = result.slice(0, 3900) + '…';
+    return result;
+  }
+
   private static escapeHtml(text: string): string {
-    return String(text)
+    return this.sanitizeTelegramText(String(text))
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;');
+  }
+
+  private static formatAlbumCollectStatusBrief(session: UserSession, extraNote?: string): string {
+    const groupCount = (session.albumGroups || []).length;
+    const fileCount = this.countAlbumFiles(session.albumGroups || []);
+    let text =
+      `✅ <b>已收录 ${groupCount} 组</b>（共 ${fileCount} 个文件，上限 ${MAX_GROUPS} 组）\n\n` +
+      `可继续发关键词或图片；点下方「完成生成」出链接。`;
+    if (extraNote) text += `\n\n${this.escapeHtml(extraNote)}`;
+    return text;
   }
 
   private static formatAlbumCollectStatus(session: UserSession, extraNote?: string): string {
@@ -94,10 +134,10 @@ export class AlbumHandler {
 
     const lines = groups.slice(-8).map((g: any, i: number) => {
       const idx = Math.max(0, groupCount - groups.slice(-8).length) + i + 1;
-      const t = String(g.caption || '').replace(/\s+/g, ' ').trim();
+      const t = this.sanitizeTelegramText(String(g.caption || '')).replace(/\s+/g, ' ').trim();
       const short = t.length > 36 ? t.slice(0, 36) + '…' : t;
-      const safe = short.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      return `${idx}. ${(g.files || []).length}个文件 — <i>${safe || '(无文案)'}</i>`;
+      const safe = this.escapeHtml(short || '(无文案)');
+      return `${idx}. ${(g.files || []).length}个文件 — <i>${safe}</i>`;
     });
     const more = groupCount > 8 ? `\n…前面还有 ${groupCount - 8} 组` : '';
     let text =
@@ -105,7 +145,7 @@ export class AlbumHandler {
       `<b>最近各组：</b>\n${lines.join('\n')}${more}\n\n` +
       `可继续发关键词或图片；点下方「完成生成」出链接。`;
     if (extraNote) text += `\n\n${this.escapeHtml(extraNote)}`;
-    return text;
+    return this.sanitizeTelegramText(text);
   }
 
   /**
@@ -118,7 +158,6 @@ export class AlbumHandler {
     session: UserSession,
     extraNote?: string
   ): Promise<void> {
-    const text = this.formatAlbumCollectStatus(session, extraNote);
     const markup = Markup.inlineKeyboard([
       [
         Markup.button.callback('✅ 完成生成', 'finish_album'),
@@ -127,21 +166,36 @@ export class AlbumHandler {
     ]);
     const oldId = this.albumStatusMsgId.get(userId);
 
-    try {
-      const sent = await telegram.sendMessage(chatId, text, {
+    const trySend = async (text: string): Promise<number | null> => {
+      const safeText = this.sanitizeTelegramText(text);
+      const sent = await telegram.sendMessage(chatId, safeText, {
         parse_mode: 'HTML',
         reply_markup: markup.reply_markup
       });
-      if (!sent?.message_id) return;
+      return sent?.message_id ?? null;
+    };
 
-      if (oldId && oldId !== sent.message_id) {
+    let text = this.formatAlbumCollectStatus(session, extraNote);
+    try {
+      let msgId: number | null = null;
+      try {
+        msgId = await trySend(text);
+      } catch (e1: any) {
+        const err1 = String(e1?.message || e1);
+        console.warn(`[相册] 详细汇总发送失败，改发简版: ${err1}`);
+        text = this.formatAlbumCollectStatusBrief(session, extraNote);
+        msgId = await trySend(text);
+      }
+      if (!msgId) return;
+
+      if (oldId && oldId !== msgId) {
         try {
           await telegram.deleteMessage(chatId, oldId);
         } catch {
           // 旧卡删失败也不影响，新卡已在底部
         }
       }
-      this.albumStatusMsgId.set(userId, sent.message_id);
+      this.albumStatusMsgId.set(userId, msgId);
       console.log(
         `[相册] 汇总已更新(底部单卡) 用户=${userId} 组=${(session.albumGroups || []).length} 文件=${this.countAlbumFiles(session.albumGroups || [])}`
       );
