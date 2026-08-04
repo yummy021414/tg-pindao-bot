@@ -72,6 +72,13 @@ export class AlbumHandler {
     return (groups || []).reduce((n, g) => n + ((g.files && g.files.length) || 0), 0);
   }
 
+  private static escapeHtml(text: string): string {
+    return String(text)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
   private static formatAlbumCollectStatus(session: UserSession, extraNote?: string): string {
     const groups = session.albumGroups || [];
     const groupCount = groups.length;
@@ -80,7 +87,7 @@ export class AlbumHandler {
     if (groupCount === 0) {
       return (
         `📭 <b>暂未收录资料</b>（上限 ${MAX_GROUPS} 组）\n\n` +
-        `${extraNote || '请发送关键词或图片。'}\n\n` +
+        `${extraNote ? this.escapeHtml(extraNote) : '请发送关键词或图片。'}\n\n` +
         `可连续连发关键词（与搜索/发布相同）；底部会更新进度。`
       );
     }
@@ -97,7 +104,7 @@ export class AlbumHandler {
       `✅ <b>已收录 ${groupCount} 组</b>（共 ${fileCount} 个文件，上限 ${MAX_GROUPS} 组）\n\n` +
       `<b>最近各组：</b>\n${lines.join('\n')}${more}\n\n` +
       `可继续发关键词或图片；点下方「完成生成」出链接。`;
-    if (extraNote) text += `\n\n${extraNote}`;
+    if (extraNote) text += `\n\n${this.escapeHtml(extraNote)}`;
     return text;
   }
 
@@ -299,7 +306,7 @@ export class AlbumHandler {
     this.albumKeywordChain.delete(userId);
   }
 
-  static async handleStart(ctx: Context, db: any): Promise<void> {
+  static async handleStart(ctx: Context, db: any, userSessions?: Map<number, UserSession>): Promise<void> {
     const userId = ctx.from?.id;
     if (!userId) return;
 
@@ -314,6 +321,8 @@ export class AlbumHandler {
     };
 
     await db.saveUserSession(userId, session);
+    if (userSessions) userSessions.set(userId, session);
+    this.clearAlbumSessionState(userId);
 
     const buttons = [
       [Markup.button.callback('🗂️ 我的相册', 'my_albums')],
@@ -367,7 +376,12 @@ export class AlbumHandler {
     });
   }
 
-  static async handleNameInput(ctx: Context, db: any, session: UserSession): Promise<void> {
+  static async handleNameInput(
+    ctx: Context,
+    db: any,
+    session: UserSession,
+    userSessions?: Map<number, UserSession>
+  ): Promise<void> {
     const text = ctx.message && 'text' in ctx.message ? ctx.message.text : '';
     if (!text || text.length > 30) {
       await ctx.reply('❌ 名字不能为空且不能超过30个字，请重新输入：');
@@ -377,6 +391,7 @@ export class AlbumHandler {
     session.albumName = text;
     session.step = 'waiting_keyword';
     await db.saveUserSession(session.userId, session);
+    if (userSessions) userSessions.set(session.userId, session);
 
     await ctx.reply(
       `✅ 已设置相册名称：<b>${text}</b>\n\n` +
@@ -470,7 +485,16 @@ export class AlbumHandler {
       ? notes.join('\n')
       : (anyAdded ? undefined : `❌ 输入「${rawInput.trim()}」未匹配到资料`);
 
-    this.scheduleAlbumCollectStatus(ctx.telegram, chatId, userId, userSessions, db, summary);
+    // 关键词：立刻更新底部汇总（不要防抖；否则用户马上点「完成生成」会清掉定时器，永远看不到反馈）
+    const deb = this.albumStatusDebounce.get(userId);
+    if (deb) {
+      clearTimeout(deb);
+      this.albumStatusDebounce.delete(userId);
+    }
+    console.log(
+      `[相册] 关键词入册 用户=${userId} 输入="${rawInput}" 当前 ${session.albumGroups?.length || 0} 组`
+    );
+    await this.upsertAlbumCollectStatus(ctx.telegram, chatId, userId, session, summary);
   }
 
   static async handleMediaMessage(ctx: Context, mediaType: string, userSessions: Map<number, UserSession>, db: any): Promise<void> {
@@ -543,7 +567,7 @@ export class AlbumHandler {
         userSessions.set(userId, currentSession);
         await db.saveUserSession(userId, currentSession);
         console.log(`📦 [相册分组] 用户 ${userId} 组 ${groupKey} 已入册，当前 ${currentSession.albumGroups.length}/${MAX_GROUPS}`);
-        this.scheduleAlbumCollectStatus(ctx.telegram, chatId, userId, userSessions, db);
+        await this.upsertAlbumCollectStatus(ctx.telegram, chatId, userId, currentSession);
       } catch (err: any) {
         console.error(`[相册模式] ❌ 分组打包失败:`, err.message);
       }

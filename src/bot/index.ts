@@ -1318,8 +1318,15 @@ export class TelegramBot {
         }
 
         // 🚀 核心修复：优先处理主机器人的核心交互模式，防止被账号控制逻辑误拦截
-        if (session && (session.mode === BotMode.AddReview || session.mode === BotMode.Upload || session.mode === BotMode.Publish)) {
-            console.log(`[路由] 进入主机器人核心分支: mode=${session.mode}, step=${session.step}`);
+        if (session && (
+          session.mode === BotMode.AddReview ||
+          session.mode === BotMode.Upload ||
+          session.mode === BotMode.Publish ||
+          session.mode === BotMode.AlbumMaker
+        )) {
+            if (session.mode !== BotMode.AlbumMaker) {
+              console.log(`[路由] 进入主机器人核心分支: mode=${session.mode}, step=${session.step}`);
+            }
             
             // 复用现有的 switch 逻辑或直接处理
             if (session.mode === BotMode.AddReview) {
@@ -1351,7 +1358,7 @@ export class TelegramBot {
             }
             if (session.mode === BotMode.AlbumMaker) {
                 if (session.step === 'waiting_album_name') {
-                    await AlbumHandler.handleNameInput(ctx, database, session);
+                    await AlbumHandler.handleNameInput(ctx, database, session, this.userSessions);
                 } else if (session.step === 'waiting_media' || session.step === 'waiting_keyword') {
                     await AlbumHandler.handleKeyword(ctx, database, this.userSessions, text);
                 } else if ((session.step as string) === 'waiting_album_auth_id') {
@@ -1473,10 +1480,10 @@ export class TelegramBot {
             return;
         }
 
-        // 检查是否在相册制作模式
+        // 检查是否在相册制作模式（兜底，上面优先分支已处理）
         if (session && session.mode === BotMode.AlbumMaker) {
             if (session.step === 'waiting_album_name') {
-                await AlbumHandler.handleNameInput(ctx, database, session);
+                await AlbumHandler.handleNameInput(ctx, database, session, this.userSessions);
             } else if (session.step === 'waiting_media' || session.step === 'waiting_keyword') {
                 await AlbumHandler.handleKeyword(ctx, database, this.userSessions, text);
             }
@@ -4768,7 +4775,7 @@ export class TelegramBot {
   // ========== 相册制作功能处理器 ==========
   private async handleAlbumStart(ctx: Context): Promise<void> {
     if (ctx.callbackQuery) await ctx.answerCbQuery().catch(() => {});
-    await AlbumHandler.handleStart(ctx, database);
+    await AlbumHandler.handleStart(ctx, database, this.userSessions);
   }
 
   private async handleCancelAlbumMaker(ctx: Context): Promise<void> {
