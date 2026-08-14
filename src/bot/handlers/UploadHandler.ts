@@ -1,6 +1,6 @@
 import { Context, Telegraf } from 'telegraf';
 import { database } from '../../database';
-import { UserSession, MediaItem } from '../../types';
+import { UserSession, MediaItem, BotMode } from '../../types';
 import { config, getAdminChannelIds, getAdminPersistentChannelId, hasAdminChannelMap } from '../../config';
 import { recordPublishEvent } from '../../services/publishAudit';
 import { checkVaultAccess } from '../../services/vault';
@@ -13,6 +13,67 @@ export class UploadHandler {
   /** key = `${userId}:${groupKey}` */
   private static groupTimeouts: Map<string, NodeJS.Timeout> = new Map();
   private static sessionReadyTimeouts: Map<number, NodeJS.Timeout> = new Map();
+
+  /** 资料 caption 含非法字符时 Telegram 会 400，导致上传完成却无反馈 */
+  private static sanitizeTelegramText(text: string): string {
+    if (text == null) return '';
+    const out: string[] = [];
+    const s = String(text);
+    for (let i = 0; i < s.length; i++) {
+      const code = s.charCodeAt(i);
+      if (code >= 0xd800 && code <= 0xdbff) {
+        if (i + 1 < s.length) {
+          const next = s.charCodeAt(i + 1);
+          if (next >= 0xdc00 && next <= 0xdfff) {
+            out.push(s[i], s[i + 1]);
+            i++;
+            continue;
+          }
+        }
+        continue;
+      }
+      if (code >= 0xdc00 && code <= 0xdfff) continue;
+      if (code === 0) continue;
+      if (code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) continue;
+      if (code === 0x7f) continue;
+      out.push(s[i]);
+    }
+    let result = out.join('');
+    result = Buffer.from(result, 'utf8').toString('utf8');
+    if (result.length > 3900) result = result.slice(0, 3900) + '…';
+    return result;
+  }
+
+  static async resolveUploadSession(
+    userId: number,
+    userSessions: Map<number, UserSession>,
+    db: typeof database
+  ): Promise<UserSession | null> {
+    let session = userSessions.get(userId);
+    if (!session) {
+      session = await db.getUserSession(userId);
+      if (session) userSessions.set(userId, session);
+    }
+    return session || null;
+  }
+
+  private static isUploadSession(session: UserSession | null | undefined): boolean {
+    if (!session) return false;
+    return session.mode === BotMode.Upload || session.mode === BotMode.AddReview;
+  }
+
+  private static async safeNotifyUser(
+    telegram: any,
+    chatId: number,
+    text: string,
+    extra?: { reply_markup?: any }
+  ): Promise<void> {
+    try {
+      await telegram.sendMessage(chatId, this.sanitizeTelegramText(text), extra);
+    } catch (e: any) {
+      console.error('[上传] 通知用户失败:', e?.message || e);
+    }
+  }
 
   private static countBatches(pending: any[]): number {
     return new Set(pending.map(m => m.batchId || 'legacy')).size;
@@ -80,7 +141,35 @@ export class UploadHandler {
   }
 
   private static escapeHtml(s: string): string {
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return this.sanitizeTelegramText(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  private static buildUploadReadyMessage(session: UserSession, brief = false): string {
+    const total = session.pendingMedia?.length || 0;
+    const groups = this.countBatches(session.pendingMedia || []);
+    const kw = this.escapeHtml(session.currentKeyword || '');
+    if (brief) {
+      return (
+        `📤 <b>上传模式</b>\n\n` +
+        `✅ <b>资料收集完成</b>\n` +
+        `• 关键词: <code>${kw}</code>\n` +
+        `• 已接收: <b>${groups}</b> 组 / <b>${total}</b> 个文件\n\n` +
+        `请点击下方按钮选择目标频道：`
+      );
+    }
+    const captionSummary = this.buildGroupCaptionSummary(session.pendingMedia || []);
+    return (
+      `📤 <b>上传模式</b>\n\n` +
+      `✅ <b>资料收集完成</b>\n` +
+      `• 关键词: <code>${kw}</code>\n` +
+      `• 已接收: <b>${groups}</b> 组 / <b>${total}</b> 个文件\n\n` +
+      `<b>各组文案（各自独立，不会串组）：</b>\n${captionSummary}\n\n` +
+      `💡 多组相册已自动分开，发布/搜索时每组用自己的文案。\n` +
+      `请点击下方按钮选择目标频道：`
+    );
   }
 
   private static itemCaption(media: any): string | undefined {
@@ -97,8 +186,12 @@ export class UploadHandler {
     const userId = ctx.from?.id;
     if (!userId) return;
 
-    const session = userSessions.get(userId);
-    if (!session || !(session.mode === 'upload' || session.mode === 'add_review')) return;
+    let session = userSessions.get(userId);
+    if (!session) {
+      session = await db.getUserSession(userId);
+      if (session) userSessions.set(userId, session);
+    }
+    if (!session || !this.isUploadSession(session)) return;
 
     session.currentKeyword = keyword;
     session.step = 'waiting_media';
@@ -128,11 +221,19 @@ export class UploadHandler {
     const userId = ctx.from?.id;
     if (!userId) return;
 
-    const session = userSessions.get(userId);
-    // 🚀 优化：允许在等待媒体、选择频道、确认中等多个阶段继续收集媒体，防止网络延迟导致丢包
+    let session = userSessions.get(userId);
+    if (!session) {
+      session = await db.getUserSession(userId);
+      if (session) userSessions.set(userId, session);
+    }
     const allowedSteps = ['waiting_media', 'selecting_channel', 'confirming'];
-    const allowedModes = ['upload', 'add_review'];
-    if (!session || !allowedModes.includes(session.mode) || !allowedSteps.includes(session.step)) {
+    if (!session || !this.isUploadSession(session)) {
+      return;
+    }
+    if (!allowedSteps.includes(session.step)) {
+      if (session.step === 'waiting_keyword') {
+        await ctx.reply('💡 请先输入关键词，再上传媒体文件。');
+      }
       return;
     }
 
@@ -248,51 +349,48 @@ export class UploadHandler {
 
       const readyTimer = setTimeout(async () => {
         this.sessionReadyTimeouts.delete(userId);
-        const currentSession = userSessions.get(userId);
-        if (!currentSession || !(currentSession.mode === 'upload' || currentSession.mode === 'add_review') || !currentSession.pendingMedia) return;
+        const currentSession = userSessions.get(userId) || await db.getUserSession(userId);
+        if (!currentSession || !this.isUploadSession(currentSession) || !currentSession.pendingMedia?.length) return;
 
-        // 收尾：给每组再同步一次文案（防止定时器竞态）
         const keys = Array.from(new Set(currentSession.pendingMedia.map((m: any) => m.groupKey).filter(Boolean)));
         for (const gk of keys) this.syncGroupCaption(currentSession.pendingMedia, gk as string);
         userSessions.set(userId, currentSession);
 
         const total = currentSession.pendingMedia.length;
         const groups = this.countBatches(currentSession.pendingMedia);
-        const captionSummary = this.buildGroupCaptionSummary(currentSession.pendingMedia);
-
         console.log(`📋 媒体收集完成 - 用户: ${userId}, ${groups} 组 / ${total} 文件`);
 
-        const messageText =
-          `📤 <b>上传模式</b>\n\n` +
-          `✅ <b>资料收集完成</b>\n` +
-          `• 关键词: <code>${currentSession.currentKeyword}</code>\n` +
-          `• 已接收: <b>${groups}</b> 组 / <b>${total}</b> 个文件\n\n` +
-          `<b>各组文案（各自独立，不会串组）：</b>\n${captionSummary}\n\n` +
-          `💡 多组相册已自动分开，发布/搜索时每组用自己的文案。\n` +
-          `请点击下方按钮选择目标频道：`;
-
-        const sendFeedback = async (retries = 3) => {
-          const targetId = ctx.from?.id || userId;
-          for (let i = 0; i < retries; i++) {
-            try {
-              await ctx.telegram.sendMessage(targetId, messageText, {
-                parse_mode: 'HTML',
-                reply_markup: {
-                  inline_keyboard: [[{ text: '📢 选择频道', callback_data: 'select_channel' }]]
-                }
-              });
-              return;
-            } catch (error: any) {
-              if (i === retries - 1) throw error;
-              console.warn(`⚠️ 发送上传反馈失败 (ID: ${targetId})，正在进行第 ${i + 1} 次重试... 错误: ${error.message}`);
-              await new Promise(r => setTimeout(r, 1500));
-            }
+        const chatId = ctx.chat?.id || userId;
+        const markup = {
+          reply_markup: {
+            inline_keyboard: [[{ text: '📢 选择频道', callback_data: 'select_channel' }]]
           }
         };
 
-        sendFeedback().catch(err => {
-          console.error('❌ 发送上传反馈最终失败:', err.message);
-        });
+        const trySend = async (brief: boolean) => {
+          const messageText = this.buildUploadReadyMessage(currentSession, brief);
+          await ctx.telegram.sendMessage(chatId, this.sanitizeTelegramText(messageText), {
+            parse_mode: 'HTML',
+            ...markup
+          });
+        };
+
+        try {
+          await trySend(false);
+        } catch (error: any) {
+          console.warn(`[上传] 详细收集反馈失败，改发简版: ${error?.message || error}`);
+          try {
+            await trySend(true);
+          } catch (error2: any) {
+            console.error('[上传] 收集反馈最终失败:', error2?.message || error2);
+            await this.safeNotifyUser(
+              ctx.telegram,
+              chatId,
+              `✅ 已收齐 ${groups} 组 / ${total} 个文件。\n请点击菜单「上传资料」重新进入后点「选择频道」，或重新发一次关键词再选频道。`,
+              markup
+            );
+          }
+        }
       }, this.SESSION_READY_MS);
 
       this.sessionReadyTimeouts.set(userId, readyTimer);
@@ -307,8 +405,11 @@ export class UploadHandler {
     const userId = ctx.from?.id;
     if (!userId) return;
 
-    const session = userSessions.get(userId);
-    if (!session || !(session.mode === 'upload' || session.mode === 'add_review') || !session.pendingMedia || session.pendingMedia.length === 0) {
+    await ctx.answerCbQuery('加载频道列表…').catch(() => {});
+
+    const session = await this.resolveUploadSession(userId, userSessions, database);
+    if (!session || !this.isUploadSession(session) || !session.pendingMedia?.length) {
+      await ctx.reply('❌ 没有待上传的资料，请重新：上传资料 → 输入关键词 → 发送媒体。');
       return;
     }
 
@@ -330,18 +431,36 @@ export class UploadHandler {
     for (const gk of gkeys) this.syncGroupCaption(session.pendingMedia, gk as string);
 
     const groupCount = this.countBatches(session.pendingMedia);
+    const kw = this.escapeHtml(session.currentKeyword || '');
     const captionSummary = this.buildGroupCaptionSummary(session.pendingMedia);
-    await ctx.reply(
+    const fullText =
       `📤 <b>上传确认</b>\n\n` +
-      `关键词: <code>${session.currentKeyword}</code>\n` +
+      `关键词: <code>${kw}</code>\n` +
       `媒体: <b>${groupCount}</b> 组 / <b>${session.pendingMedia.length}</b> 个文件\n\n` +
       `<b>各组文案：</b>\n${captionSummary}\n\n` +
-      `请选择操作：`,
-      {
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: channelButtons }
+      `请选择操作：`;
+    const briefText =
+      `📤 <b>上传确认</b>\n\n` +
+      `关键词: <code>${kw}</code>\n` +
+      `媒体: <b>${groupCount}</b> 组 / <b>${session.pendingMedia.length}</b> 个文件\n\n` +
+      `请选择操作：`;
+    const markup = { parse_mode: 'HTML' as const, reply_markup: { inline_keyboard: channelButtons } };
+    try {
+      await ctx.reply(this.sanitizeTelegramText(fullText), markup);
+    } catch (error: any) {
+      console.warn('[上传] 确认页详细文案失败，改发简版:', error?.message || error);
+      try {
+        await ctx.reply(this.sanitizeTelegramText(briefText), markup);
+      } catch (error2: any) {
+        console.error('[上传] 确认页发送失败:', error2?.message || error2);
+        await this.safeNotifyUser(
+          ctx.telegram,
+          ctx.chat?.id || userId,
+          `📤 上传确认\n\n关键词: ${session.currentKeyword}\n媒体: ${groupCount} 组 / ${session.pendingMedia.length} 个文件\n\n请选择操作：`,
+          { reply_markup: { inline_keyboard: channelButtons } }
+        );
       }
-    );
+    }
   }
 
   static async handleSaveOnly(
@@ -352,14 +471,16 @@ export class UploadHandler {
     const userId = ctx.from?.id;
     if (!userId) return;
 
-    const session = userSessions.get(userId);
-    if (!session || !(session.mode === 'upload' || session.mode === 'add_review') || !session.pendingMedia || !session.currentKeyword) {
+    await ctx.answerCbQuery('保存中…').catch(() => {});
+
+    const session = await this.resolveUploadSession(userId, userSessions, db);
+    if (!session || !this.isUploadSession(session) || !session.pendingMedia?.length || !session.currentKeyword) {
+      await ctx.reply('❌ 上传会话已失效或没有资料，请重新开始上传。');
       return;
     }
 
     try {
-      // 显示处理中消息
-      const processingMsg = await ctx.reply('💾 正在保存并同步备份...');
+      const processingMsg = await ctx.reply('💾 正在保存并同步备份…');
 
       let savedCount = 0;
       const savedItems: MediaItem[] = []; // 🚀 记录以便后续备份
@@ -425,7 +546,7 @@ export class UploadHandler {
 
       // 如果是好评模式，触发全员推送
       if (isReviewMode) {
-        this.broadcastReviewUpdate(ctx, db);
+        this.broadcastReviewUpdate(ctx.telegram, db);
       }
 
       const groupCount = this.countBatches(savedItems);
@@ -455,9 +576,9 @@ export class UploadHandler {
         await ctx.reply(completionText, { reply_markup: completionKeyboard });
       }
 
-    } catch (error) {
+    } catch (error: any) {
       console.error('保存媒体错误:', error);
-      await ctx.reply('❌ 保存时发生错误，请稍后重试。');
+      await ctx.reply(`❌ 保存时发生错误：${error?.message || '请稍后重试'}`);
     }
   }
 
@@ -470,16 +591,72 @@ export class UploadHandler {
     const userId = ctx.from?.id;
     if (!userId) return;
 
-    const session = userSessions.get(userId);
-    if (!session || !(session.mode === 'upload' || session.mode === 'add_review') || !session.pendingMedia || !session.currentKeyword || !session.selectedChannel) {
+    await ctx.answerCbQuery('处理中…').catch(() => {});
+
+    const session = await this.resolveUploadSession(userId, userSessions, db);
+    if (!session || !this.isUploadSession(session) || !session.pendingMedia?.length || !session.currentKeyword || !session.selectedChannel) {
+      await ctx.reply('❌ 上传会话已失效，请重新：上传资料 → 关键词 → 媒体 → 选择频道。');
       return;
     }
 
+    const chatId = ctx.chat?.id || userId;
+    let processingMsg: { message_id: number } | null = null;
     try {
-      // 显示处理中消息
-      const processingMsg = await ctx.reply('💾📢 正在保存并发布...');
+      processingMsg = await ctx.reply('💾📢 正在保存并发布（请勿重复点击）…');
+    } catch {}
 
-      console.log(`🔄 开始处理上传 - 用户: ${userId}, 关键词: ${session.currentKeyword}, 媒体数量: ${session.pendingMedia.length}`);
+    const sessionSnap = {
+      currentKeyword: session.currentKeyword,
+      selectedChannel: session.selectedChannel,
+      pendingMedia: JSON.parse(JSON.stringify(session.pendingMedia)),
+      pendingText: session.pendingText,
+      mode: session.mode
+    };
+
+    setImmediate(async () => {
+      try {
+        await this.runSaveAndPublishJob({
+          telegram: ctx.telegram,
+          chatId,
+          processingMsgId: processingMsg?.message_id,
+          userId,
+          sessionSnap,
+          userSessions,
+          db,
+          bot
+        });
+      } catch (error: any) {
+        console.error('保存并发布后台任务失败:', error);
+        await this.safeNotifyUser(
+          ctx.telegram,
+          chatId,
+          `❌ 保存并发布失败：${error?.message || '未知错误'}\n\n请检查 bot 是否为频道管理员后重试。`,
+          { reply_markup: { inline_keyboard: [[{ text: '🏠 返回主菜单', callback_data: 'back_to_main' }]] } }
+        );
+      }
+    });
+  }
+
+  private static async runSaveAndPublishJob(opts: {
+    telegram: any;
+    chatId: number;
+    processingMsgId?: number;
+    userId: number;
+    sessionSnap: {
+      currentKeyword: string;
+      selectedChannel: string;
+      pendingMedia: any[];
+      pendingText?: string;
+      mode: string;
+    };
+    userSessions: Map<number, UserSession>;
+    db: typeof database;
+    bot: Telegraf;
+  }): Promise<void> {
+    const { telegram, chatId, processingMsgId, userId, sessionSnap, userSessions, db, bot } = opts;
+    const session = sessionSnap;
+
+    try {
 
       let savedCount = 0;
       const mediaIds: number[] = [];
@@ -557,47 +734,43 @@ export class UploadHandler {
       userSessions.delete(userId);
       await db.clearUserSession(userId);
 
-      // 🚀 新增：如果是好评模式，触发全员推送
       if (isReviewMode) {
-        this.broadcastReviewUpdate(ctx, db);
+        this.broadcastReviewUpdate(telegram, db);
       }
 
-      // 编辑处理中消息为完成消息 (带错误捕获)
       const groupCount = this.countBatches(savedItems);
+      const channelName = await this.getChannelName(bot, session.selectedChannel);
       const completionMsg = `✅ 保存并发布完成！\n\n` +
         `关键词: "${session.currentKeyword}"\n` +
-        `频道: ${await this.getChannelName(bot, session.selectedChannel)}\n` +
+        `频道: ${channelName}\n` +
         `已处理 ${groupCount} 组 / ${savedCount} 个媒体文件` +
         `${vaultNote}\n\n` +
         `💡 多组已分开发布，不会并成一组。`;
       const completionKbd = { inline_keyboard: [[{ text: '🏠 返回主菜单', callback_data: 'back_to_main' }]] };
 
-      try {
-        await ctx.telegram.editMessageText(
-          ctx.chat?.id,
-          processingMsg.message_id,
-          undefined,
-          completionMsg,
-          { reply_markup: completionKbd }
-      );
-      } catch (editError) {
-        await ctx.reply(completionMsg, { reply_markup: completionKbd });
+      if (processingMsgId) {
+        try {
+          await telegram.editMessageText(chatId, processingMsgId, undefined, completionMsg, {
+            reply_markup: completionKbd
+          });
+        } catch {
+          await this.safeNotifyUser(telegram, chatId, completionMsg, { reply_markup: completionKbd });
+        }
+      } else {
+        await this.safeNotifyUser(telegram, chatId, completionMsg, { reply_markup: completionKbd });
       }
 
     } catch (error: any) {
       console.error('保存并发布错误:', error);
-      
-      // 清理会话，即使出错也要清理
+
       try {
         userSessions.delete(userId);
         await db.clearUserSession(userId);
       } catch (cleanupError) {
         console.error('清理会话失败:', cleanupError);
       }
-      
-      // 提供更具体的错误信息
+
       let errorMessage = '❌ 发布时发生错误，请稍后重试。';
-      
       if (error.message?.includes('发布超时')) {
         errorMessage = '❌ 发布超时，可能是网络问题或媒体文件过多。\n\n💡 建议：\n1. 减少一次上传的文件数量\n2. 检查网络连接\n3. 稍后重试';
       } else if (error.message?.includes('无法发布到频道')) {
@@ -605,14 +778,19 @@ export class UploadHandler {
       } else if (error.response?.error_code === 429) {
         errorMessage = '❌ 发布频率过快，请稍后重试。\n\n💡 建议：减少一次上传的文件数量';
       }
-      
-      await ctx.reply(errorMessage, { 
-        reply_markup: { 
-          inline_keyboard: [
-            [{ text: '🏠 返回主菜单', callback_data: 'back_to_main' }]
-          ] 
-        } 
-      });
+
+      const errorKbd = {
+        reply_markup: { inline_keyboard: [[{ text: '🏠 返回主菜单', callback_data: 'back_to_main' }]] }
+      };
+      if (processingMsgId) {
+        try {
+          await telegram.editMessageText(chatId, processingMsgId, undefined, errorMessage, errorKbd);
+        } catch {
+          await this.safeNotifyUser(telegram, chatId, errorMessage, errorKbd);
+        }
+      } else {
+        await this.safeNotifyUser(telegram, chatId, errorMessage, errorKbd);
+      }
     }
   }
 
@@ -892,7 +1070,7 @@ export class UploadHandler {
   /**
    * 🚀 新增：群发好评库更新通知给所有活跃用户
    */
-  private static async broadcastReviewUpdate(ctx: Context, db: typeof database): Promise<void> {
+  private static async broadcastReviewUpdate(telegram: Context['telegram'], db: typeof database): Promise<void> {
     try {
       const users = await db.getAllActiveUsers();
       if (users.length === 0) return;
@@ -909,7 +1087,7 @@ export class UploadHandler {
 
         for (const user of users) {
           try {
-            await ctx.telegram.sendMessage(user.id, broadcastMsg);
+            await telegram.sendMessage(user.id, broadcastMsg);
             successCount++;
             
             // 🚀 频率限制保护
@@ -922,7 +1100,7 @@ export class UploadHandler {
               await db.removeUser(user.id);
               // 2. 提醒管理员
               const userDisplay = user.username ? `@${user.username}` : (user.first_name || '未知用户');
-              await ctx.telegram.sendMessage(adminId, `🗑️ **用户已失效**\n\n用户 \`${userDisplay}\` (ID: \`${user.id}\`) 已拉黑机器人，已自动将其从活跃列表中移除。`, { parse_mode: 'Markdown' }).catch(() => {});
+              await telegram.sendMessage(adminId, `🗑️ **用户已失效**\n\n用户 \`${userDisplay}\` (ID: \`${user.id}\`) 已拉黑机器人，已自动将其从活跃列表中移除。`, { parse_mode: 'Markdown' }).catch(() => {});
             }
           }
         }

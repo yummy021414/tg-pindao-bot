@@ -1216,12 +1216,14 @@ export class TelegramBot {
     const userId = ctx.from?.id;
         if (!userId)
             return;
+    await ctx.answerCbQuery('已选择频道').catch(() => {});
     const callbackData = ctx.callbackQuery && 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : undefined;
         if (!callbackData)
             return;
     const channelId = callbackData.replace('upload_channel_', '');
-    const session = this.userSessions.get(userId);
+    const session = await UploadHandler.resolveUploadSession(userId, this.userSessions, database);
     if (!session || (session.mode !== 'upload' && session.mode !== BotMode.AddReview) || !session.pendingMedia || session.pendingMedia.length === 0) {
+      await ctx.reply('❌ 上传会话已失效，请重新：上传资料 → 关键词 → 媒体 → 选择频道。').catch(() => {});
       return;
     }
     session.selectedChannel = channelId;
@@ -1229,11 +1231,19 @@ export class TelegramBot {
     this.userSessions.set(userId, session);
     await database.saveUserSession(userId, session);
     const channelName = await this.getChannelName(channelId);
-        await ctx.editMessageText(`📤 上传确认\n\n` +
+        try {
+            await ctx.editMessageText(`📤 上传确认\n\n` +
       `关键词: "${session.currentKeyword}"\n` +
       `目标频道: ${channelName}\n` +
       `媒体文件: ${session.pendingMedia.length} 个\n\n` +
             `请选择操作：`, this.getUploadConfirmKeyboard());
+        } catch {
+            await ctx.reply(`📤 上传确认\n\n` +
+      `关键词: "${session.currentKeyword}"\n` +
+      `目标频道: ${channelName}\n` +
+      `媒体文件: ${session.pendingMedia.length} 个\n\n` +
+            `请选择操作：`, this.getUploadConfirmKeyboard());
+        }
   }
     async handleSaveOnly(ctx: Context) {
     await UploadHandler.handleSaveOnly(ctx, this.userSessions, database);
