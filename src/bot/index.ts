@@ -162,6 +162,7 @@ export class TelegramBot {
     this.bot.command('mappings', this.withStrictAuthorization(AndroidSendCommands.mappings));
     this.bot.command('sendtasks', this.withStrictAuthorization(AndroidSendCommands.tasks));
     // Android 控制台：按钮化面板，所有 as: 前缀的回调统一走 AndroidPanel 分发。
+    this.bot.command('notesync', this.withStrictAuthorization(AndroidSendCommands.syncNotes));
     this.bot.command('android', this.withStrictAuthorization(AndroidPanel.open.bind(AndroidPanel)));
     this.bot.action(/^as:/, this.withStrictAuthorization(AndroidPanel.handleCallback.bind(AndroidPanel)));
     // ========== 账号控制功能（新增） ==========
@@ -1333,9 +1334,16 @@ export class TelegramBot {
         if (this.isAdmin(userId) && await AndroidSendCommands.handleCircleLeadReply(ctx)) {
           return;
         }
+        if (this.isAdmin(userId) && await AndroidSendCommands.handleSyncText(ctx)) {
+          AndroidPanel.clearNoteSyncWait(userId);
+          return;
+        }
+        if (this.isAdmin(userId) && await AndroidPanel.handleTypedKeyword(ctx)) {
+          return;
+        }
 
         // Telegram 不把中文识别为 command entity，因此在文本流显式支持需求文档中的中文命令。
-        const chineseCommand = text.trim().match(/^\/(发送|绑定用户|绑定内容|映射列表|发送任务|安卓)(?:\s|$)/u)?.[1];
+        const chineseCommand = text.trim().match(/^\/(发送|绑定用户|绑定内容|映射列表|发送任务|安卓|同步)(?:\s|$)/u)?.[1];
         if (chineseCommand) {
           if (!this.isAdmin(userId)) {
             await ctx.reply('❌ 仅管理员可使用 Android 自动发送命令。');
@@ -1347,6 +1355,7 @@ export class TelegramBot {
           if (chineseCommand === '映射列表') await AndroidSendCommands.mappings(ctx);
           if (chineseCommand === '发送任务') await AndroidSendCommands.tasks(ctx);
           if (chineseCommand === '安卓') await AndroidPanel.open(ctx);
+          if (chineseCommand === '同步') await AndroidSendCommands.syncNotes(ctx);
           return;
         }
 

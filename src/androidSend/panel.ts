@@ -2,12 +2,14 @@ import { Context, Markup } from 'telegraf';
 import { InlineKeyboardMarkup } from 'telegraf/typings/core/types/typegram';
 import { androidNoteSyncEnabled, isSuperAdmin } from '../config';
 import { database } from '../database';
-import { quotaLine } from './commands';
+import { quotaLine, AndroidSendCommands } from './commands';
 import { queueNoteSyncTasksForItems, summarizeSyncableItems } from './noteSync';
 import { resolveContentForKeyword } from './content';
 
 const ACTION_LABELS: Record<number, string> = { 1: '📝 笔记', 2: '🖼 展示', 3: '📍 位置', 4: '🔥 三连' };
-const KEYWORDS_PER_PAGE = 8;
+
+/** 点了「同步资料」之后，下一条普通文字当作关键词。 */
+const waitingNoteSyncKeyword = new Set<number>();
 
 /**
  * Android 控制台：把原本的纯文本命令（/send、/mappings、/sendtasks 等）
@@ -16,7 +18,22 @@ const KEYWORDS_PER_PAGE = 8;
  * 下标在最终一步会重新解析成名字回显，映射列表极少变动，错位风险可以接受。
  */
 export class AndroidPanel {
+  static clearNoteSyncWait(userId?: number): void {
+    if (userId) waitingNoteSyncKeyword.delete(userId);
+  }
+
+  static async handleTypedKeyword(ctx: Context): Promise<boolean> {
+    const userId = ctx.from?.id;
+    if (!userId || !waitingNoteSyncKeyword.has(userId)) return false;
+    waitingNoteSyncKeyword.delete(userId);
+    const text = ctx.message && 'text' in ctx.message ? ctx.message.text.trim() : '';
+    if (!text || text.startsWith('/')) return false;
+    await AndroidSendCommands.syncNotes(ctx, text);
+    return true;
+  }
+
   static async open(ctx: Context): Promise<void> {
+    if (ctx.from?.id) waitingNoteSyncKeyword.delete(ctx.from.id);
     await this.renderMenu(ctx);
   }
 
@@ -29,7 +46,10 @@ export class AndroidPanel {
     }
 
     try {
-      if (data === 'as:menu') return await this.renderMenu(ctx);
+      if (data === 'as:menu') {
+        if (ctx.from?.id) waitingNoteSyncKeyword.delete(ctx.from.id);
+        return await this.renderMenu(ctx);
+      }
       if (data === 'as:maps') return await this.renderMappings(ctx);
       if (data === 'as:tasks') return await this.renderTasks(ctx);
       if (data === 'as:set') return await this.renderSettings(ctx);
@@ -48,10 +68,9 @@ export class AndroidPanel {
         const [userIndex, contentIndex, action] = data.slice(10).split(':').map(Number);
         return await this.createSendTask(ctx, userIndex, contentIndex, action as 1 | 2 | 3 | 4);
       }
-      if (data === 'as:ns' || data.startsWith('as:ns:p:')) {
-        const page = data.startsWith('as:ns:p:') ? Number(data.slice(8)) : 0;
-        return await this.renderNoteSyncKeywords(ctx, page);
-      }
+      if (data === 'as:ns' || data.startsWith('as:ns:p:')) return await this.renderNoteSyncKeywords(ctx);
+      if (data.startsWith('as:ns:k:')) return await this.renderNoteSyncConfirm(ctx, Number(data.slice(8)));
+      if (data.startsWith('as:ns:go:')) return await this.queueNoteSync(ctx, Number(data.slice(9)));
       if (data.startsWith('as:ns:k:')) return await this.renderNoteSyncConfirm(ctx, Number(data.slice(8)));
       if (data.startsWith('as:ns:go:')) return await this.queueNoteSync(ctx, Number(data.slice(9)));
       if (data.startsWith('as:lead:')) {
@@ -78,8 +97,7 @@ export class AndroidPanel {
   private static async renderMenu(ctx: Context): Promise<void> {
     const message =
       '🤖 Android 控制台\n\n' +
-      '日常用法：手机 Worker 把圈子推到这里 → 引用那条消息回复「关键词 1」（1笔记 2展示 3位置 4三连）。\n' +
-      '不用先绑定通讯录。发送用的是资料库里已有的关键词，不必再传一遍。\n\n' +
+      '日常用法：圈子推过来 → 引用回复「关键词 1」。同步笔记直接发「同步 轻语」。\n' +
       `${await quotaLine()}`;
     const keyboard = Markup.inlineKeyboard([
       [Markup.button.callback('📤 发送笔记', 'as:send'), Markup.button.callback('📥 同步资料到笔记', 'as:ns')],
@@ -186,7 +204,7 @@ export class AndroidPanel {
     return userId && isSuperAdmin(userId) ? undefined : userId;
   }
 
-  private static async renderNoteSyncKeywords(ctx: Context, page: number): Promise<void> {
+  private static async renderNoteSyncKeywords(ctx: Context): Promise<void> {
     if (!androidNoteSyncEnabled) {
       await this.render(
         ctx,
@@ -195,31 +213,11 @@ export class AndroidPanel {
       );
       return;
     }
-    const keywords = await database.getAllKeywords(await this.mediaScopeUserId(ctx));
-    if (keywords.length === 0) {
-      await this.render(ctx, '📥 同步资料到笔记\n\n资料库还是空的，先上传一些资料。', this.backKeyboard());
-      return;
-    }
-    const totalPages = Math.ceil(keywords.length / KEYWORDS_PER_PAGE);
-    const safePage = Math.min(Math.max(page, 0), totalPages - 1);
-    const start = safePage * KEYWORDS_PER_PAGE;
-    const slice = keywords.slice(start, start + KEYWORDS_PER_PAGE);
-
-    const rows = slice.map((keyword, offset) => [
-      Markup.button.callback(`📁 ${keyword}`, `as:ns:k:${start + offset}`)
-    ]);
-    const nav = [];
-    if (safePage > 0) nav.push(Markup.button.callback('⬅️ 上一页', `as:ns:p:${safePage - 1}`));
-    if (safePage < totalPages - 1) nav.push(Markup.button.callback('➡️ 下一页', `as:ns:p:${safePage + 1}`));
-    if (nav.length) rows.push(nav);
-    rows.push([Markup.button.callback('⬅️ 返回主面板', 'as:menu')]);
-
+    if (ctx.from?.id) waitingNoteSyncKeyword.add(ctx.from.id);
     await this.render(
       ctx,
-      `📥 同步资料到笔记\n\n选一个人（关键词），把 TA 在机器人资料库里已有的图片视频同步成手机 App 笔记。\n` +
-        `不用重新上传。点确认就会排队，电脑上的 Worker 领取后马上执行。\n` +
-        `第 ${safePage + 1}/${totalPages} 页，共 ${keywords.length} 个关键词。`,
-      Markup.inlineKeyboard(rows).reply_markup
+      '📥 同步资料到笔记\n\n直接发关键词即可，不用点列表。例如：\n轻语\n或随时发：同步 轻语\n\n资料库里已有的人会立刻排队，Worker 空闲就执行，不等发送冷却。',
+      this.backKeyboard()
     );
   }
 
@@ -230,7 +228,7 @@ export class AndroidPanel {
 
   private static async renderNoteSyncConfirm(ctx: Context, index: number): Promise<void> {
     const keyword = await this.keywordByIndex(ctx, index);
-    if (!keyword) return await this.renderNoteSyncKeywords(ctx, 0);
+    if (!keyword) return await this.renderNoteSyncKeywords(ctx);
     const items = await database.getMediaByKeyword(keyword, await this.mediaScopeUserId(ctx));
     const { batches, files } = summarizeSyncableItems(items);
     if (files === 0) {
@@ -257,7 +255,7 @@ export class AndroidPanel {
     const chatId = ctx.chat?.id;
     if (!chatId) return;
     const keyword = await this.keywordByIndex(ctx, index);
-    if (!keyword) return await this.renderNoteSyncKeywords(ctx, 0);
+    if (!keyword) return await this.renderNoteSyncKeywords(ctx);
     const items = await database.getMediaByKeyword(keyword, await this.mediaScopeUserId(ctx));
     const queued = await queueNoteSyncTasksForItems(items, keyword, chatId);
     await this.render(

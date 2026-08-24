@@ -51,3 +51,36 @@ export function summarizeSyncableItems(items: MediaItem[]): { batches: number; f
   }
   return { batches: batchIds.size, files };
 }
+
+/** 资料库里解析关键词：精确匹配，其次忽略大小写。 */
+export async function resolveLibraryKeyword(input: string, scopeUserId?: number): Promise<string | null> {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+  const exact = await database.getMediaByKeyword(trimmed, scopeUserId);
+  if (exact.length) return trimmed;
+  const keywords = await database.getAllKeywords(scopeUserId);
+  return keywords.find(item => item === trimmed)
+    || keywords.find(item => item.toLowerCase() === trimmed.toLowerCase())
+    || null;
+}
+
+export async function queueNoteSyncForKeyword(
+  input: string,
+  chatId: number,
+  scopeUserId?: number
+): Promise<{ ok: true; keyword: string; queued: number; batches: number; files: number } | { ok: false; error: string }> {
+  const keyword = await resolveLibraryKeyword(input, scopeUserId);
+  if (!keyword) {
+    return { ok: false, error: `资料库没有关键词「${input.trim()}」。把资料上传到机器人后，再发：同步 ${input.trim()}` };
+  }
+  const items = await database.getMediaByKeyword(keyword, scopeUserId);
+  const summary = summarizeSyncableItems(items);
+  if (summary.files === 0) {
+    return { ok: false, error: `「${keyword}」没有可同步的图片/视频。` };
+  }
+  const queued = await queueNoteSyncTasksForItems(items, keyword, chatId);
+  if (queued <= 0) {
+    return { ok: false, error: `「${keyword}」排队失败，请看服务器日志。` };
+  }
+  return { ok: true, keyword, queued, ...summary };
+}

@@ -30,10 +30,10 @@ const positiveInt = (raw: string | undefined, fallback: number, minimum = 0): nu
  * 节流保护：连续私信是第三方 App 风控最敏感的行为。
  * 两次真实发送之间取 [min,max] 的随机间隔，并限制每日发送次数（0 表示不限）。
  */
-const androidSendMinIntervalMs = positiveInt(process.env.ANDROID_SEND_MIN_INTERVAL_MS, 45_000);
+const androidSendMinIntervalMs = positiveInt(process.env.ANDROID_SEND_MIN_INTERVAL_MS, 20_000);
 export const androidSendGuard = {
   minIntervalMs: androidSendMinIntervalMs,
-  maxIntervalMs: Math.max(androidSendMinIntervalMs, positiveInt(process.env.ANDROID_SEND_MAX_INTERVAL_MS, 150_000)),
+  maxIntervalMs: Math.max(androidSendMinIntervalMs, positiveInt(process.env.ANDROID_SEND_MAX_INTERVAL_MS, 45_000)),
   dailyLimit: positiveInt(process.env.ANDROID_DAILY_SEND_LIMIT, 30)
 };
 

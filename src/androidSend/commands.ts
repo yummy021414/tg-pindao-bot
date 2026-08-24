@@ -2,6 +2,7 @@ import { Context } from 'telegraf';
 import { androidSendGuard, isSuperAdmin } from '../config';
 import { database } from '../database';
 import { resolveContentForKeyword } from './content';
+import { queueNoteSyncForKeyword } from './noteSync';
 
 function messageText(ctx: Context): string {
   return ctx.message && 'text' in ctx.message ? ctx.message.text.trim() : '';
@@ -26,14 +27,14 @@ export async function quotaLine(): Promise<string> {
   const quota = await database.getAndroidSendQuota(androidSendGuard.dailyLimit);
   const parts = [
     androidSendGuard.dailyLimit > 0
-      ? `今日 ${quota.usedToday}/${androidSendGuard.dailyLimit}`
-      : `今日 ${quota.usedToday}（未设上限）`,
+      ? `今日发送 ${quota.usedToday}/${androidSendGuard.dailyLimit}`
+      : `今日发送 ${quota.usedToday}（未设上限）`,
     `等待 ${quota.pending}`,
     `执行中 ${quota.running}`
   ];
   const cooldownMs = quota.cooldownUntil ? new Date(quota.cooldownUntil).getTime() - Date.now() : 0;
-  if (cooldownMs > 0) parts.push(`冷却 ${Math.ceil(cooldownMs / 1000)} 秒`);
-  if (androidSendGuard.dailyLimit > 0 && quota.remainingToday === 0) parts.push('已达上限，顺延到明天');
+  if (cooldownMs > 0) parts.push(`发送冷却 ${Math.ceil(cooldownMs / 1000)} 秒（同步笔记不受影响）`);
+  if (androidSendGuard.dailyLimit > 0 && quota.remainingToday === 0) parts.push('发送已达上限，顺延到明天');
   return `📊 ${parts.join('｜')}`;
 }
 
@@ -99,6 +100,34 @@ export class AndroidSendCommands {
       remark: remarkParts.join(' | ') || undefined
     });
     await ctx.reply(`✅ 已保存内容映射\n内容：${content.contentId}\n关键词：${content.tgKeyword}\n定位标识：${content.appContentIdentifier}`);
+  }
+
+  /** 直接输入关键词同步：同步 轻语 或 /notesync 轻语 */
+  static async syncNotes(ctx: Context, keywordOverride?: string): Promise<void> {
+    const keyword = (keywordOverride ?? commandArguments(ctx)).trim();
+    if (!keyword) {
+      await ctx.reply('把资料库里的人同步到手机笔记，直接发：\n同步 轻语\n或 /notesync 轻语');
+      return;
+    }
+    const chatId = ctx.chat?.id;
+    if (!chatId) return;
+    const scopeUserId = ctx.from?.id && isSuperAdmin(ctx.from.id) ? undefined : ctx.from?.id;
+    const result = await queueNoteSyncForKeyword(keyword, chatId, scopeUserId);
+    if (result.ok === false) {
+      await ctx.reply(`❌ ${result.error}`);
+      return;
+    }
+    await ctx.reply(
+      `✅ 已排队 ${result.queued} 条「${result.keyword}」的笔记同步（${result.batches} 组 / ${result.files} 个文件）。\n` +
+        `Worker 空闲就会执行，不等发送冷却。\n\n${await quotaLine()}`
+    );
+  }
+
+  static async handleSyncText(ctx: Context): Promise<boolean> {
+    const matched = messageText(ctx).match(/^同步\s+(\S.*)$/u);
+    if (!matched) return false;
+    await this.syncNotes(ctx, matched[1].trim());
+    return true;
   }
 
   static async send(ctx: Context): Promise<void> {
