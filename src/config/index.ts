@@ -19,7 +19,7 @@ export const config: BotConfig = {
 
 /** 本地 Android 执行端访问队列时使用。生产环境必须配置为随机长字符串。 */
 export const androidWorkerToken = process.env.ANDROID_WORKER_TOKEN || '';
-export const androidTaskLeaseMs = Math.max(30_000, parseInt(process.env.ANDROID_TASK_LEASE_MS || '300000', 10) || 300000);
+export const androidTaskLeaseMs = Math.max(30_000, parseInt(process.env.ANDROID_TASK_LEASE_MS || '120000', 10) || 120000);
 
 const positiveInt = (raw: string | undefined, fallback: number, minimum = 0): number => {
   const value = parseInt(raw || '', 10);

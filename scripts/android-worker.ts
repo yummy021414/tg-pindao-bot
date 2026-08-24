@@ -1044,6 +1044,12 @@ async function main(): Promise<void> {
   const pollIntervalMs = config.pollIntervalMs || 3000;
   console.log(`[Android Worker] 已启动：${config.workerId}，设备：${config.deviceId || '默认设备'}，adb：${adbBin}${config.dryRun ? '（演练模式，不会真正发送）' : ''}`);
   let lastCircleSyncAt = 0;
+  const stop = () => {
+    console.log('[Android Worker] 正在退出…');
+    process.exit(0);
+  };
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
   while (true) {
     try {
       const response = await http.get('/api/android/tasks/next', { params: { workerId: config.workerId } });

@@ -1275,7 +1275,15 @@ export class JsonDatabase {
 
     // 需求 §8：同一时刻只允许一个任务在操作 App，多个执行端也不能各领一条并行跑。
     const running = rows.find(task => task.status === 'running');
-    if (running) {
+    if (running && running.workerId === workerId) {
+      // 同一台电脑 Ctrl+C 后再启动：把未完成的任务交回给它，避免空等租约 5 分钟。
+      running.status = 'pending';
+      running.errorMessage = '执行端已重连，任务重新入队';
+      running.workerId = undefined;
+      running.claimToken = undefined;
+      running.leaseUntil = undefined;
+      changed = true;
+    } else if (running) {
       await persist();
       const remainingMs = running.leaseUntil ? new Date(running.leaseUntil).getTime() - now.getTime() : 30_000;
       return {
