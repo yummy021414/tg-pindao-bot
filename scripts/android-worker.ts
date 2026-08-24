@@ -634,16 +634,31 @@ async function mediaScan(remotePath: string): Promise<void> {
 async function pushNoteAssets(task: Task, payload: NoteSyncPayload): Promise<PushedAsset[]> {
   await fs.mkdir(ASSET_CACHE_DIR, { recursive: true });
   const pushed: PushedAsset[] = [];
+  const total = payload.files.length;
+  console.log(`[Android Worker] 先下载 ${total} 个素材再操作手机，这一步手机不会动，请不要 Ctrl+C。`);
 
   for (const [index, file] of payload.files.entries()) {
-    const response = await http.get(`/api/android/media/${file.fileId}`, { responseType: 'arraybuffer', timeout: 180_000 });
-    const contentType = String(response.headers['content-type'] || '').toLowerCase();
-    const isVideo = contentType.startsWith('video/') || (!contentType.startsWith('image/') && file.fileType === 'video');
+    const cacheName = `file-${String(index + 1).padStart(2, '0')}-${file.fileId.slice(-24).replace(/[^\w-]/g, '_')}`;
+    const cachePath = path.join(ASSET_CACHE_DIR, cacheName);
+    let buffer: Buffer;
+    if (existsSync(cachePath)) {
+      console.log(`[Android Worker] 素材 ${index + 1}/${total} 已有缓存，跳过下载。`);
+      buffer = await fs.readFile(cachePath);
+    } else {
+      console.log(`[Android Worker] 正在下载素材 ${index + 1}/${total}（${file.fileType}）…`);
+      const response = await http.get(`/api/android/media/${file.fileId}`, { responseType: 'arraybuffer', timeout: 180_000 });
+      buffer = Buffer.from(response.data);
+      await fs.writeFile(cachePath, buffer);
+      console.log(`[Android Worker] 素材 ${index + 1}/${total} 已下载 ${Math.round(buffer.length / 1024)} KB。`);
+    }
+    const isVideo = (buffer.length >= 12 && buffer.slice(4, 8).toString('ascii') === 'ftyp')
+      || (!(buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8) && file.fileType === 'video');
     const fileName = `tgnote-${task.taskId}-${String(index + 1).padStart(2, '0')}.${isVideo ? 'mp4' : 'jpg'}`;
     const localPath = path.join(ASSET_CACHE_DIR, fileName);
     const remotePath = `/sdcard/${isVideo ? 'Movies' : 'Pictures'}/${fileName}`;
 
-    await fs.writeFile(localPath, Buffer.from(response.data));
+    await fs.writeFile(localPath, buffer);
+    console.log(`[Android Worker] 正在推送到手机 ${index + 1}/${total}：${fileName}`);
     await adb('push', localPath, remotePath);
     await mediaScan(remotePath);
     await fs.unlink(localPath).catch(() => undefined);
@@ -651,6 +666,7 @@ async function pushNoteAssets(task: Task, payload: NoteSyncPayload): Promise<Pus
     pushed.push({ fileType: isVideo ? 'video' : 'photo', remotePath, fileName });
   }
   // 扫描是异步入库的，紧接着打开选择器有时还看不到，留一点余量。
+  console.log('[Android Worker] 素材已全部进手机相册，开始点 App。');
   await wait(1500);
   return pushed;
 }
@@ -728,6 +744,7 @@ async function executeNoteSync(task: Task): Promise<void> {
 
   const assets = await pushNoteAssets(task, payload);
   try {
+    console.log('[Android Worker] 开始操作手机：冷启动 App → 我的笔记。');
     await launchApp();
     await runRecipientSteps(selectors.entrySteps, task, '进入我的笔记：');
 
