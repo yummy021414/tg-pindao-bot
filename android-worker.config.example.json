@@ -13,6 +13,7 @@
     "noteSync 用于「上传资料 → 同步成 App 笔记」：素材先 adb push 进相册，再按文件名在系统选择器里精确选中。",
     "noteSync.pickerItem 的 $file 会被换成 tgnote-<taskId>-NN.jpg 这样的文件名；系统选择器一次最多选 9 个，超出会自动分批。",
     "中文文案需要手机上装 ADBKeyBoard，否则笔记照建但文案会被跳过，并在回执里标注。",
+    "noteSync.entrySteps 全走固定坐标+盲滑动（swipe: [x1,y1,x2,y2]）：“我的”个人页是 Flutter/WebView 渲染，uiautomator 抓不到控件，且“我的笔记”要下滑才露出来。换设备需重新核对这三步坐标。",
     "optional: true 的步骤找不到会跳过而不报错。加好友链路：资料页点“添加好友”→ 申请页点“确定”→ 回资料页点“发送消息”进会话；已是好友时资料页没有“添加好友”按钮，两个可选步骤自动跳过。",
     "不想每次都加好友的话，把两条路线里的“添加好友/确认好友申请”步骤删掉即可（“已有会话”路线还要一并删掉“顶部标题进资料页”和“发送消息”）。"
   ],
@@ -84,8 +85,9 @@
     "cancel": { "contentDesc": "取消" },
     "noteSync": {
       "entrySteps": [
-        { "label": "我的 Tab", "tapAt": [970, 2176] },
-        { "label": "我的笔记", "tapAt": [540, 1826] }
+        { "label": "我的 Tab", "tapAt": [972, 2177] },
+        { "label": "下滑露出我的笔记", "swipe": [540, 1600, 540, 700] },
+        { "label": "我的笔记入口", "tapAt": [540, 1014] }
       ],
       "noteCounter": { "contentDescContains": "条笔记" },
       "createSteps": [

@@ -56,6 +56,12 @@ type Selector = {
    * 已是好友时资料页没有这个按钮，此时直接进入下一步。
    */
   optional?: boolean;
+  /**
+   * 盲滑动一步（不点击）。用于 uiautomator 抓不到内容的页面（例如"我的"个人页是
+   * Flutter/WebView 渲染，控件树读到的是旧窗口），只能靠坐标滑动把目标项露出来。
+   * 格式 [x1, y1, x2, y2]，按 screenBase 等比缩放。
+   */
+  swipe?: [number, number, number, number];
 };
 
 type NoteSyncFile = { fileId: string; fileType: 'photo' | 'video' };
@@ -479,6 +485,16 @@ async function cleanupToStart(task: Task): Promise<void> {
 async function runRecipientSteps(steps: Array<Selector & { label?: string }>, task: Task, prefix = ''): Promise<void> {
   for (const [index, step] of steps.entries()) {
     const label = `${prefix}${step.label || `第 ${index + 1} 步`}`;
+    if (step.swipe) {
+      // 盲滑动：uiautomator 抓不到的页面（"我的"个人页）只能按坐标滑。
+      const [x1, y1, x2, y2] = step.swipe;
+      const from = await scalePoint({ x: x1, y: y1 });
+      const to = await scalePoint({ x: x2, y: y2 });
+      await adb('shell', 'input', 'swipe', String(from.x), String(from.y), String(to.x), String(to.y), '400');
+      invalidateUi();
+      await wait(1000);
+      continue;
+    }
     if (step.optional) {
       // 可选步骤（如"添加好友"）：已是好友时按钮不存在。超时设 2 秒，
       // 一次抓屏（约 2.3 秒）结束后即判定跳过，不做第二次。
