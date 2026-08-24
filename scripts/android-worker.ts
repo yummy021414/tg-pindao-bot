@@ -24,6 +24,12 @@ type Selector = {
   resourceIdContains?: string;
   contentDesc?: string;
   contentDescContains?: string;
+  /**
+   * 名字/正文在 text 或 content-desc 里都算命中。圈子卡片的昵称经常只在其中一个字段。
+   */
+  nameContains?: string;
+  /** 多个命中时取面积最小的（点名字 pill，而不是整张卡片）。 */
+  matchPick?: 'first' | 'smallest';
   className?: string;
   /** 该页控件既无 id 也无描述时，只能用绝对坐标；按 screenBase 等比缩放。 */
   tapAt?: [number, number];
@@ -41,6 +47,8 @@ type Selector = {
   };
   /** 当前屏找不到时向上滑动继续找。 */
   scroll?: boolean;
+  /** 覆盖全局 scrollAttempts，圈子找人时需要多翻几屏。 */
+  scrollAttempts?: number;
   /**
    * 限定在屏幕的某个区域内匹配（0~1 的比例）。
    * 例如底部 Tab 的"消息"要配 { top: 0.85 }，否则会误命中聊天里的"[消息自毁]"提示条。
@@ -112,6 +120,8 @@ type WorkerConfig = {
   circleSync?: {
     enabled: boolean;
     intervalMs?: number;
+    /** 每轮向下翻几屏再汇总投递，默认 6。 */
+    scanScreens?: number;
     entry: Selector;
   };
   selectors: {
@@ -321,6 +331,7 @@ function selectorFor(selector: Selector, task: Task): Selector {
     ...selector,
     text: replace(selector.text),
     textContains: replace(selector.textContains),
+    nameContains: replace(selector.nameContains),
     resourceId: replace(selector.resourceId),
     resourceIdContains: replace(selector.resourceIdContains),
     contentDesc: replace(selector.contentDesc),
@@ -331,11 +342,15 @@ function selectorFor(selector: Selector, task: Task): Selector {
 function hasMatcher(selector: Selector): boolean {
   return Boolean(
     selector.text || selector.textContains || selector.resourceId ||
-    selector.resourceIdContains || selector.contentDesc || selector.contentDescContains
+    selector.resourceIdContains || selector.contentDesc || selector.contentDescContains || selector.nameContains
   );
 }
 
 function nodeMatches(node: UiNode, selector: Selector): boolean {
+  if (selector.nameContains !== undefined) {
+    const haystack = `${node.text}\n${node.contentDesc}`;
+    if (!haystack.includes(selector.nameContains)) return false;
+  }
   if (selector.text !== undefined && node.text !== selector.text) return false;
   if (selector.textContains !== undefined && !node.text.includes(selector.textContains)) return false;
   if (selector.resourceId !== undefined && node.resourceId !== selector.resourceId) return false;
@@ -375,7 +390,18 @@ async function find(selector: Selector, task: Task, force = false): Promise<UiNo
     if (area.right !== undefined && center.x > area.right * size.width) return false;
     return true;
   };
-  return nodes.find(node => nodeMatches(node, resolved) && inArea(node)) || null;
+  const hits = nodes.filter(node => nodeMatches(node, resolved) && inArea(node));
+  if (!hits.length) return null;
+  if (selector.matchPick === 'smallest') {
+    return [...hits].sort((a, b) => {
+      const first = boundsBox(a.bounds);
+      const second = boundsBox(b.bounds);
+      const areaA = (first.right - first.left) * (first.bottom - first.top);
+      const areaB = (second.right - second.left) * (second.bottom - second.top);
+      return areaA - areaB;
+    })[0];
+  }
+  return hits[0];
 }
 
 async function swipe(fromRatio: number, toRatio: number): Promise<void> {
@@ -395,7 +421,7 @@ async function scrollToTop(): Promise<void> {
 }
 
 async function waitFor(selector: Selector, task: Task, label: string, timeoutMs = config.waitTimeoutMs || 10_000): Promise<UiNode> {
-  const scrollAttempts = selector.scroll ? (config.scrollAttempts ?? 6) : 0;
+  const scrollAttempts = selector.scroll ? (selector.scrollAttempts ?? config.scrollAttempts ?? 6) : 0;
   if (scrollAttempts > 0) {
     const visible = await find(selector, task);
     if (visible) return visible;
@@ -816,21 +842,17 @@ async function complete(task: Task, success: boolean, errorMessage?: string): Pr
   });
 }
 
-/**
- * 圈子页把发帖人资料放在 content-desc、笔记正文放在 text，两者是同一张卡片的不同子节点。
- * 必须按卡片 bounds 归属配对：只按出现顺序配对，会把 A 的正文安到 B 头上。
- */
-async function syncCircleLeads(): Promise<void> {
-  const sync = config.circleSync;
-  if (!sync?.enabled) return;
-  const probeTask: Task = { taskId: 'circle-sync', appUserName: '', appContentIdentifier: '', claimToken: '' };
-  await launchApp();
-  await tapSelector(sync.entry, probeTask, '圈子入口', 1200);
-
-  const nodes = await dumpUi();
-  const cards = nodes.filter(node => node.contentDesc.includes('\n') && /报名[:：]\s*\d+/u.test(node.contentDesc));
+function collectCircleLeadsFromNodes(nodes: UiNode[]): Array<{ appUserId: string; appUserName: string; circleContent: string }> {
+  const cards = nodes.filter(node => {
+    const desc = node.contentDesc;
+    if (!desc.includes('\n')) return false;
+    const first = desc.split('\n')[0].trim();
+    if (first.length < 2 || first.length > 40) return false;
+    if (/^(消息|联系人|圈子|发现|我的|全部|未分组)$/u.test(first)) return false;
+    return /报名[:：]\s*\d+/u.test(desc) || /[\u4e00-\u9fff]/.test(first);
+  });
   const texts = nodes.filter(node => node.text.trim().length >= 2);
-  const leads = cards.map(card => {
+  return cards.map(card => {
     const box = boundsBox(card.bounds);
     const body = texts
       .filter(node => {
@@ -839,16 +861,43 @@ async function syncCircleLeads(): Promise<void> {
       })
       .map(node => node.text.trim())
       .join(' ');
-    const appUserName = card.contentDesc.split('\n')[0].trim();
-    return { appUserId: appUserName, appUserName, circleContent: body };
-  }).filter(lead => lead.appUserName && lead.circleContent).slice(0, 10);
+    const lines = card.contentDesc.split('\n').map(item => item.trim()).filter(Boolean);
+    const appUserName = lines[0];
+    const fromDesc = lines.slice(1).filter(line => !/报名[:：]/u.test(line) && line !== appUserName).join(' ');
+    return { appUserId: appUserName, appUserName, circleContent: body || fromDesc };
+  }).filter(lead => lead.appUserName && lead.circleContent);
+}
 
+/**
+ * 圈子页把发帖人资料放在 content-desc、笔记正文放在 text，两者是同一张卡片的不同子节点。
+ * 必须按卡片 bounds 归属配对：只按出现顺序配对，会把 A 的正文安到 B 头上。
+ * 每轮多翻几屏，否则一次只能抓到当前可见的两三条。
+ */
+async function syncCircleLeads(): Promise<void> {
+  const sync = config.circleSync;
+  if (!sync?.enabled) return;
+  const probeTask: Task = { taskId: 'circle-sync', appUserName: '', appContentIdentifier: '', claimToken: '' };
+  await launchApp();
+  await tapSelector(sync.entry, probeTask, '圈子入口', 1200);
+
+  const seen = new Map<string, { appUserId: string; appUserName: string; circleContent: string }>();
+  const screens = Math.max(1, sync.scanScreens ?? 6);
+  for (let screen = 0; screen < screens; screen++) {
+    const leads = collectCircleLeadsFromNodes(await dumpUi(screen > 0));
+    for (const lead of leads) {
+      const key = `${lead.appUserName}\n${lead.circleContent}`;
+      if (!seen.has(key)) seen.set(key, lead);
+    }
+    if (screen < screens - 1) await swipeUp();
+  }
+
+  const leads = [...seen.values()].slice(0, 40);
   if (leads.length === 0) {
     console.log('[Android Worker] 圈子扫描未找到可投递线索。');
     return;
   }
   const response = await http.post('/api/android/circle-leads', { leads });
-  console.log(`[Android Worker] 圈子扫描：新增 ${response.data?.created?.length || 0} 条，跳过 ${response.data?.skipped || 0} 条。`);
+  console.log(`[Android Worker] 圈子扫描：新增 ${response.data?.created?.length || 0} 条，跳过 ${response.data?.skipped || 0} 条（本轮看到 ${leads.length} 条）。`);
 }
 
 /**

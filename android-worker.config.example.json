@@ -4,7 +4,7 @@
     "会话页底部工具栏没有 resource-id / content-desc，只能用 tapAt 绝对坐标。",
     "areaRatio 用来把匹配限制在屏幕某个区域：底部 Tab 的“消息”不加区域限制会误命中聊天里的“[消息自毁]”提示。",
     "content 的 anchorOffset.absoluteX=75 表示：先按描述命中笔记条目，再点它左侧同一行的勾选圆圈。",
-    "recipientRoutes 按顺序尝试。圈子线索创建的任务会优先走「圈子现找」：点头像（取卡片里最小的图，避免点到帖子大图）→ 资料页发消息；找不到再去消息列表。",
+    "recipientRoutes 按顺序尝试。圈子线索创建的任务会优先走「圈子现找」：按昵称点名字，找不到再去消息列表。",
     "发送入口必须走会话底部的“+”→“笔记”。底部工具栏第三个图标打开的是笔记管理页，选完不会发给当前会话。",
     "sendAction 的“笔记/展示/位置/三连”不是切换标签：勾选内容后点下去就直接发送并返回会话。",
     "success 两条要同时命中：标题栏出现对方昵称（说明已退回会话）＋会话里出现该内容的卡片。",
@@ -32,6 +32,7 @@
   "circleSync": {
     "enabled": false,
     "intervalMs": 180000,
+    "scanScreens": 6,
     "entry": { "contentDescContains": "圈子", "areaRatio": { "top": 0.85 } }
   },
   "selectors": {
@@ -41,10 +42,11 @@
         "steps": [
           { "label": "圈子 Tab", "contentDescContains": "圈子", "areaRatio": { "top": 0.85 } },
           {
-            "label": "该用户的头像",
-            "contentDescContains": "$user",
+            "label": "该用户的名字",
+            "nameContains": "$user",
             "scroll": true,
-            "within": { "className": "android.widget.ImageView", "clickable": true, "pick": "smallest" }
+            "scrollAttempts": 10,
+            "matchPick": "smallest"
           },
           { "label": "添加好友", "contentDesc": "添加好友", "optional": true },
           { "label": "确认好友申请", "contentDesc": "确定", "optional": true },
@@ -57,8 +59,9 @@
           { "label": "消息 Tab", "contentDescContains": "消息", "areaRatio": { "top": 0.85 } },
           {
             "label": "会话",
-            "contentDescContains": "$user",
+            "nameContains": "$user",
             "scroll": true,
+            "scrollAttempts": 8,
             "areaRatio": { "top": 0.12, "bottom": 0.88 }
           },
           { "label": "顶部标题进资料页", "tapAt": [540, 205] },
@@ -92,7 +95,7 @@
       ],
       "noteCounter": { "contentDescContains": "条笔记" },
       "createSteps": [
-        { "label": "右上角加号", "contentDesc": "显示菜单" },
+        { "label": "右上角加号", "tapAt": [909, 204] },
         { "label": "新增笔记", "contentDesc": "新增笔记" }
       ],
       "textBlock": { "contentDesc": "文字" },
