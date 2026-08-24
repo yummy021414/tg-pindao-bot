@@ -227,8 +227,8 @@ export class Database {
     return this.jsonDb.listAndroidMappings();
   }
 
-  async createAndroidSendTasks(appUser: AndroidAppUser, contents: AndroidAppContent[], requestedByChatId: number, action?: AndroidSendAction): Promise<AndroidSendTask[]> {
-    return this.jsonDb.createAndroidSendTasks(appUser, contents, requestedByChatId, action);
+  async createAndroidSendTasks(appUser: AndroidAppUser, contents: AndroidAppContent[], requestedByChatId: number, action?: AndroidSendAction, extras?: { fromCircle?: boolean; circleContent?: string }): Promise<AndroidSendTask[]> {
+    return this.jsonDb.createAndroidSendTasks(appUser, contents, requestedByChatId, action, extras);
   }
 
   async createAndroidNoteSyncTask(payload: AndroidNoteSyncPayload, requestedByChatId: number): Promise<AndroidSendTask> {

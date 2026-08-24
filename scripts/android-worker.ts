@@ -50,7 +50,7 @@ type Selector = {
    * 先命中锚点（例如圈子里某个用户的卡片），再点落在它范围内的子控件（例如头像）。
    * 卡片高度随内容变化，按包含关系找子控件比按固定偏移猜坐标可靠。
    */
-  within?: { className?: string; clickable?: boolean; pick?: 'first' | 'last' };
+  within?: { className?: string; clickable?: boolean; pick?: 'first' | 'last' | 'smallest' };
   /**
    * 找不到就跳过而不是报错。用于"添加好友"这类只在特定状态下出现的按钮：
    * 已是好友时资料页没有这个按钮，此时直接进入下一步。
@@ -82,6 +82,9 @@ type Task = {
   appContentPosition?: string;
   action?: 1 | 2 | 3 | 4;
   claimToken: string;
+  /** 由圈子线索创建的发送任务：先从圈子找人，消息列表只做兜底。 */
+  fromCircle?: boolean;
+  circleContent?: string;
 };
 
 type ClaimHold = { reason: 'worker-busy' | 'daily-limit' | 'cooldown'; message: string; retryAfterMs: number };
@@ -162,6 +165,8 @@ type NoteSyncSelectors = {
   /** 编辑页底部的"图片" / "视频"，点了会打开系统相册选择器。 */
   photoBlock: Selector;
   videoBlock: Selector;
+  /** 插完照片后的「下一步」；有的机型是向导式，没有这一步就跳过。 */
+  nextStep?: Selector;
   /** 系统选择器里的条目，描述含文件名；用 $file 占位。 */
   pickerItem: Selector;
   /** 系统选择器右下角的"确认"。 */
@@ -310,6 +315,7 @@ function selectorFor(selector: Selector, task: Task): Selector {
     .replace(/\$content/g, task.appContentIdentifier)
     .replace(/\$position/g, task.appContentPosition || '')
     .replace(/\$user/g, task.appUserName)
+    .replace(/\$circle/g, (task.circleContent || task.appUserName).replace(/\s+/g, ' ').slice(0, 18))
     .replace(/\$action/g, actionLabel);
   return {
     ...selector,
@@ -440,6 +446,11 @@ async function resolvePoint(selector: Selector, task: Task, label: string, timeo
     const sorted = children.sort((a, b) => {
       const first = boundsBox(a.bounds);
       const second = boundsBox(b.bounds);
+      if (pick === 'smallest') {
+        const areaA = (first.right - first.left) * (first.bottom - first.top);
+        const areaB = (second.right - second.left) * (second.bottom - second.top);
+        return areaA - areaB || first.top - second.top || first.left - second.left;
+      }
       return first.top - second.top || first.left - second.left;
     });
     return boxCenter(boundsBox((pick === 'last' ? sorted[sorted.length - 1] : sorted[0]).bounds));
@@ -536,7 +547,12 @@ async function openConversation(task: Task): Promise<void> {
 
   if (recipientRoutes?.length) {
     const failures: string[] = [];
-    for (const route of recipientRoutes) {
+    const routes = [...recipientRoutes].sort((left, right) => {
+      if (!task.fromCircle) return 0;
+      const score = (name: string) => (name.includes('圈子') ? 0 : 1);
+      return score(left.name) - score(right.name);
+    });
+    for (const route of routes) {
       try {
         await runRecipientSteps(route.steps, task, `${route.name}：`);
         return;
@@ -594,18 +610,19 @@ async function pushNoteAssets(task: Task, payload: NoteSyncPayload): Promise<Pus
   const pushed: PushedAsset[] = [];
 
   for (const [index, file] of payload.files.entries()) {
-    const isVideo = file.fileType === 'video';
+    const response = await http.get(`/api/android/media/${file.fileId}`, { responseType: 'arraybuffer', timeout: 180_000 });
+    const contentType = String(response.headers['content-type'] || '').toLowerCase();
+    const isVideo = contentType.startsWith('video/') || (!contentType.startsWith('image/') && file.fileType === 'video');
     const fileName = `tgnote-${task.taskId}-${String(index + 1).padStart(2, '0')}.${isVideo ? 'mp4' : 'jpg'}`;
     const localPath = path.join(ASSET_CACHE_DIR, fileName);
     const remotePath = `/sdcard/${isVideo ? 'Movies' : 'Pictures'}/${fileName}`;
 
-    const response = await http.get(`/api/android/media/${file.fileId}`, { responseType: 'arraybuffer', timeout: 180_000 });
     await fs.writeFile(localPath, Buffer.from(response.data));
     await adb('push', localPath, remotePath);
     await mediaScan(remotePath);
     await fs.unlink(localPath).catch(() => undefined);
 
-    pushed.push({ fileType: file.fileType, remotePath, fileName });
+    pushed.push({ fileType: isVideo ? 'video' : 'photo', remotePath, fileName });
   }
   // 扫描是异步入库的，紧接着打开选择器有时还看不到，留一点余量。
   await wait(1500);
@@ -706,8 +723,24 @@ async function executeNoteSync(task: Task): Promise<void> {
 
     const photos = assets.filter(asset => asset.fileType === 'photo');
     const videos = assets.filter(asset => asset.fileType === 'video');
+    console.log(`[Android Worker] 素材分类：照片 ${photos.length}，视频 ${videos.length}`);
     if (photos.length) await pickAssets(task, selectors, selectors.photoBlock, photos, '照片');
-    if (videos.length) await pickAssets(task, selectors, selectors.videoBlock, videos, '视频');
+    if (photos.length && selectors.nextStep) {
+      try {
+        await tapSelector(selectors.nextStep, task, '下一步', 1200, 4000);
+      } catch {
+        console.log('[Android Worker] 「下一步」未出现，继续找视频入口。');
+      }
+    }
+    if (videos.length) {
+      try {
+        await pickAssets(task, selectors, selectors.videoBlock, videos, '视频');
+      } catch (error) {
+        if (!selectors.nextStep) throw error;
+        await tapSelector(selectors.nextStep, task, '下一步（视频前）', 1200, 4000).catch(() => undefined);
+        await pickAssets(task, selectors, selectors.videoBlock, videos, '视频');
+      }
+    }
 
     if (config.dryRun) {
       throw new Error('演练模式（dryRun）：已完成新增笔记的选择器验证，未保存。确认无误后把 dryRun 改为 false。');

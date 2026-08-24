@@ -64,6 +64,9 @@ export interface AndroidSendTask {
   appContentIdentifier: string;
   appContentPosition?: string;
   /** 1=笔记，2=展示，3=位置，4=三连 */
+  fromCircle?: boolean;
+  /** 圈子线索原文，Worker 用它在圈子里定位同一张卡片。 */
+  circleContent?: string;
   action: AndroidSendAction;
   status: AndroidSendTaskStatus;
   requestedByChatId: number;
@@ -1159,7 +1162,8 @@ export class JsonDatabase {
     appUser: AndroidAppUser,
     contents: AndroidAppContent[],
     requestedByChatId: number,
-    action: AndroidSendAction = 1
+    action: AndroidSendAction = 1,
+    extras?: { fromCircle?: boolean; circleContent?: string }
   ): Promise<AndroidSendTask[]> {
     const rows = this.data.androidSendTasks || (this.data.androidSendTasks = []);
     const now = new Date().toISOString();
@@ -1172,6 +1176,8 @@ export class JsonDatabase {
       appContentIdentifier: content.appContentIdentifier,
       appContentPosition: content.appContentPosition,
       action,
+      fromCircle: extras?.fromCircle,
+      circleContent: extras?.circleContent,
       status: 'pending',
       requestedByChatId,
       createdAt: now
@@ -1364,7 +1370,7 @@ export class JsonDatabase {
     task.leaseUntil = undefined;
     // 间隔一次算定并存下来，避免每次轮询重新随机导致冷却时间忽长忽短。
     // 同步笔记没有私信行为，不该顺延下一条真实发送的时间。
-    if ((task.kind || 'send') === 'send' && cooldown && cooldown.minIntervalMs > 0) {
+    if ((task.kind || 'send') === 'send' && success && cooldown && cooldown.minIntervalMs > 0) {
       const span = Math.max(0, cooldown.maxIntervalMs - cooldown.minIntervalMs);
       const delay = cooldown.minIntervalMs + Math.floor(Math.random() * (span + 1));
       this.data.androidSendCooldownUntil = new Date(Date.now() + delay).toISOString();
@@ -1432,7 +1438,10 @@ export class JsonDatabase {
       createdAt: lead.capturedAt,
       updatedAt: lead.capturedAt
     };
-    return this.createAndroidSendTasks(appUser, contents, requestedByChatId, action);
+    return this.createAndroidSendTasks(appUser, contents, requestedByChatId, action, {
+      fromCircle: true,
+      circleContent: lead.circleContent
+    });
   }
 
   async close(): Promise<void> {
