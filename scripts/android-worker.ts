@@ -672,10 +672,11 @@ async function executeNoteSync(task: Task): Promise<void> {
     await runRecipientSteps(selectors.createSteps, task, '新增笔记：');
 
     let captionSkipped = false;
-    if (payload.caption?.trim()) {
+    const noteText = [payload.tgKeyword?.trim(), payload.caption?.trim()].filter(Boolean).join('\n');
+    if (noteText) {
       if (await hasAdbKeyboard()) {
         await tapSelector(selectors.textBlock, task, '插入文字块', 1500);
-        await typeUnicodeText(payload.caption.trim());
+        await typeUnicodeText(noteText);
         await pressBack(1000);
       } else {
         // 没装 ADBKeyBoard 就没法输入中文，此时同步媒体比整单失败更有用。
@@ -716,7 +717,13 @@ async function executeTask(task: Task): Promise<void> {
   await launchApp();
   await openConversation(task);
   await runRecipientSteps(selectors.sharePanelSteps, task, '打开分享面板：');
-  await tapSelector(selectors.content, task, `勾选内容「${task.appContentIdentifier}」`, 600);
+  try {
+    await tapSelector(selectors.content, task, `勾选内容「${task.appContentIdentifier}」`, 600);
+  } catch (error) {
+    if (!task.appContentPosition) throw error;
+    const fallback = { ...selectors.content, contentDescContains: task.appContentPosition };
+    await tapSelector(fallback, task, `勾选内容（文案）「${task.appContentPosition}」`, 600);
+  }
 
   if (selectors.selectedIndicator) {
     // 勾选没生效就发送，等于把空内容或错内容发给真人，所以这里失败必须整单终止。

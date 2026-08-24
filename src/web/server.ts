@@ -146,7 +146,7 @@ export function startWebServer(bot: Telegraf) {
         if (!isNew) continue;
         const sent = await bot.telegram.sendMessage(
           config.superAdminId,
-          `📥 圈子线索\n用户：${lead.appUserName}\n内容：${lead.circleContent}\n\n点下方按钮发送；也可引用本消息回复「关键词 1」（1=笔记 2=展示 3=位置 4=三连）。`,
+          `📥 圈子线索\n用户：${lead.appUserName}\n内容：${lead.circleContent}\n\n点下方按钮发送；也可引用本消息回复「关键词 1」（1=笔记 2=展示 3=位置 4=三连）。关键词用资料库里已有的即可，例如：轻语 1`,
           { reply_markup: AndroidPanel.leadKeyboard(lead.leadId) }
         );
         await database.bindAndroidCircleLeadToBotMessage(lead.leadId, sent.chat.id, sent.message_id);

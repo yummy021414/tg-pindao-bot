@@ -1412,6 +1412,12 @@ export class JsonDatabase {
     return (this.data.androidCircleLeads || []).find(item => item.leadId === leadId) || null;
   }
 
+  async listAndroidCircleLeads(limit = 20): Promise<AndroidCircleLead[]> {
+    return [...(this.data.androidCircleLeads || [])]
+      .sort((a, b) => b.capturedAt.localeCompare(a.capturedAt))
+      .slice(0, limit);
+  }
+
   async createAndroidSendTasksForCircleLead(
     leadId: string,
     contents: AndroidAppContent[],

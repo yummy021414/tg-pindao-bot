@@ -4,6 +4,7 @@ import { androidNoteSyncEnabled, isSuperAdmin } from '../config';
 import { database } from '../database';
 import { quotaLine } from './commands';
 import { queueNoteSyncTasksForItems, summarizeSyncableItems } from './noteSync';
+import { resolveContentForKeyword } from './content';
 
 const ACTION_LABELS: Record<number, string> = { 1: '📝 笔记', 2: '🖼 展示', 3: '📍 位置', 4: '🔥 三连' };
 const KEYWORDS_PER_PAGE = 8;
@@ -77,7 +78,8 @@ export class AndroidPanel {
   private static async renderMenu(ctx: Context): Promise<void> {
     const message =
       '🤖 Android 控制台\n\n' +
-      '发送笔记、同步资料、查看任务都在这里点按钮完成。\n' +
+      '日常用法：手机 Worker 把圈子推到这里 → 引用那条消息回复「关键词 1」（1笔记 2展示 3位置 4三连）。\n' +
+      '不用先绑定通讯录。发送用的是资料库里已有的关键词，不必再传一遍。\n\n' +
       `${await quotaLine()}`;
     const keyboard = Markup.inlineKeyboard([
       [Markup.button.callback('📤 发送笔记', 'as:send'), Markup.button.callback('📥 同步资料到笔记', 'as:ns')],
@@ -87,53 +89,61 @@ export class AndroidPanel {
     await this.render(ctx, message, keyboard.reply_markup);
   }
 
-  // ============ 发送流程：选人 → 选内容 → 选动作 ============
+  // ============ 发送流程：选圈子线索 → 选资料库关键词 → 选动作 ============
 
   private static async renderSendUsers(ctx: Context): Promise<void> {
-    const { users } = await database.listAndroidMappings();
-    if (users.length === 0) {
+    const leads = await database.listAndroidCircleLeads(20);
+    if (leads.length === 0) {
       await this.render(
         ctx,
-        '📤 发送笔记\n\n还没有用户映射。\n先用命令录入：\n/binduser 用户标识 | App用户名 | 备注',
+        '📤 发送笔记\n\n还没有圈子线索。\n\n' +
+          '请在电脑上启动 Worker（npm run android:worker），并把 circleSync.enabled 设为 true。\n' +
+          '圈子推过来之后，直接引用那条消息回复「关键词 1」就会排队发送。\n' +
+          '关键词用资料库里已有的即可，不用 /binduser。',
         this.backKeyboard()
       );
       return;
     }
-    const rows = users.map((user, index) => [
-      Markup.button.callback(`👤 ${user.appUserId}｜${user.appUserName}`, `as:send:u:${index}`)
+    const rows = leads.map((lead, index) => [
+      Markup.button.callback(`👤 ${lead.appUserName}`.slice(0, 60), `as:send:u:${index}`)
     ]);
     rows.push([Markup.button.callback('⬅️ 返回', 'as:menu')]);
-    await this.render(ctx, '📤 发送笔记\n\n第 1 步：选择要发给谁。', Markup.inlineKeyboard(rows).reply_markup);
+    await this.render(
+      ctx,
+      '📤 发送笔记\n\n第 1 步：选择最近推过来的圈子用户。\n也可以回到线索消息，引用回复「关键词 1」。',
+      Markup.inlineKeyboard(rows).reply_markup
+    );
   }
 
   private static async renderSendContents(ctx: Context, userIndex: number): Promise<void> {
-    const { users, contents } = await database.listAndroidMappings();
-    const user = users[userIndex];
-    if (!user) return await this.renderSendUsers(ctx);
-    if (contents.length === 0) {
+    const leads = await database.listAndroidCircleLeads(20);
+    const lead = leads[userIndex];
+    if (!lead) return await this.renderSendUsers(ctx);
+    const keywords = await database.getAllKeywords(await this.mediaScopeUserId(ctx));
+    if (keywords.length === 0) {
       await this.render(
         ctx,
-        `📤 发送给 ${user.appUserName}\n\n还没有内容映射。\n先用命令录入：\n/bindcontent 内容ID | TG关键词 | App内容标识`,
+        `📤 发送给 ${lead.appUserName}\n\n资料库是空的。先把这个人的资料上传到机器人，再用那个关键词发送。`,
         this.backKeyboard('as:send')
       );
       return;
     }
-    const rows = contents.map((content, index) => [
-      Markup.button.callback(`📄 ${content.tgKeyword}｜${content.appContentIdentifier}`, `as:send:c:${userIndex}:${index}`)
+    const rows = keywords.slice(0, 24).map((keyword, index) => [
+      Markup.button.callback(`📁 ${keyword}`.slice(0, 60), `as:send:c:${userIndex}:${index}`)
     ]);
     rows.push([Markup.button.callback('⬅️ 返回', 'as:send')]);
     await this.render(
       ctx,
-      `📤 发送给 ${user.appUserName}\n\n第 2 步：选择发送哪条内容。`,
+      `📤 发送给 ${lead.appUserName}\n\n第 2 步：选择资料库里的关键词（已有资料，不必再上传）。`,
       Markup.inlineKeyboard(rows).reply_markup
     );
   }
 
   private static async renderSendActions(ctx: Context, userIndex: number, contentIndex: number): Promise<void> {
-    const { users, contents } = await database.listAndroidMappings();
-    const user = users[userIndex];
-    const content = contents[contentIndex];
-    if (!user || !content) return await this.renderSendUsers(ctx);
+    const leads = await database.listAndroidCircleLeads(20);
+    const lead = leads[userIndex];
+    const keyword = await this.keywordByIndex(ctx, contentIndex);
+    if (!lead || !keyword) return await this.renderSendUsers(ctx);
     const rows = [
       [1, 2].map(action => Markup.button.callback(ACTION_LABELS[action], `as:send:a:${userIndex}:${contentIndex}:${action}`)),
       [3, 4].map(action => Markup.button.callback(ACTION_LABELS[action], `as:send:a:${userIndex}:${contentIndex}:${action}`)),
@@ -141,7 +151,7 @@ export class AndroidPanel {
     ];
     await this.render(
       ctx,
-      `📤 发送给 ${user.appUserName}\n内容：${content.tgKeyword}（${content.appContentIdentifier}）\n\n第 3 步：选择发送形式。点了就会排队。`,
+      `📤 发送给 ${lead.appUserName}\n内容：${keyword}\n\n第 3 步：选择发送形式。点了就会排队，电脑上的 Worker 会立刻领取执行。`,
       Markup.inlineKeyboard(rows).reply_markup
     );
   }
@@ -149,16 +159,17 @@ export class AndroidPanel {
   private static async createSendTask(ctx: Context, userIndex: number, contentIndex: number, action: 1 | 2 | 3 | 4): Promise<void> {
     const chatId = ctx.chat?.id;
     if (!chatId) return;
-    const { users, contents } = await database.listAndroidMappings();
-    const user = users[userIndex];
-    const content = contents[contentIndex];
-    if (!user || !content) return await this.renderSendUsers(ctx);
-    const tasks = await database.createAndroidSendTasks(user, [content], chatId, action);
+    const leads = await database.listAndroidCircleLeads(20);
+    const lead = leads[userIndex];
+    const keyword = await this.keywordByIndex(ctx, contentIndex);
+    const content = keyword ? await resolveContentForKeyword(keyword, await this.mediaScopeUserId(ctx)) : null;
+    if (!lead || !content) return await this.renderSendUsers(ctx);
+    const tasks = await database.createAndroidSendTasksForCircleLead(lead.leadId, [content], chatId, action);
     await this.render(
       ctx,
-      `✅ 任务已排队，手机执行完会单独回执。\n\n` +
-        `目标：${user.appUserId}（${user.appUserName}）\n` +
-        `内容：${content.tgKeyword}（${content.appContentIdentifier}）\n` +
+      `✅ 任务已排队，电脑上的 Worker 领取后就会在手机上执行。\n\n` +
+        `目标：${lead.appUserName}\n` +
+        `内容：${content.tgKeyword}\n` +
         `形式：${ACTION_LABELS[action]}\n` +
         `任务：${tasks[0].taskId}\n\n${await quotaLine()}`,
       Markup.inlineKeyboard([
@@ -205,7 +216,8 @@ export class AndroidPanel {
 
     await this.render(
       ctx,
-      `📥 同步资料到笔记\n\n选一个人（关键词），把 TA 在机器人里的资料同步成手机 App 里的笔记。\n` +
+      `📥 同步资料到笔记\n\n选一个人（关键词），把 TA 在机器人资料库里已有的图片视频同步成手机 App 笔记。\n` +
+        `不用重新上传。点确认就会排队，电脑上的 Worker 领取后马上执行。\n` +
         `第 ${safePage + 1}/${totalPages} 页，共 ${keywords.length} 个关键词。`,
       Markup.inlineKeyboard(rows).reply_markup
     );
@@ -280,22 +292,22 @@ export class AndroidPanel {
       await this.render(ctx, '❌ 这条线索已不存在（可能被清理），请等待新的推送。', this.backKeyboard());
       return;
     }
-    const { contents } = await database.listAndroidMappings();
-    if (contents.length === 0) {
+    const keywords = await database.getAllKeywords(await this.mediaScopeUserId(ctx));
+    if (keywords.length === 0) {
       await this.render(
         ctx,
-        `${this.leadHeader(lead)}\n\n还没有内容映射，先录入：\n/bindcontent 内容ID | TG关键词 | App内容标识`,
+        `${this.leadHeader(lead)}\n\n资料库还是空的。先把要发的资料上传到机器人，再用那个关键词引用回复，例如：轻语 1`,
         this.leadKeyboard(leadId)
       );
       return;
     }
-    const rows = contents.map((content, index) => [
-      Markup.button.callback(`📄 ${content.tgKeyword}｜${content.appContentIdentifier}`, `as:leadk:${leadId}:${action}:${index}`)
+    const rows = keywords.slice(0, 24).map((keyword, index) => [
+      Markup.button.callback(`📁 ${keyword}`.slice(0, 60), `as:leadk:${leadId}:${action}:${index}`)
     ]);
     rows.push([Markup.button.callback('⬅️ 重选形式', `as:lead:${leadId}:0`)]);
     await this.render(
       ctx,
-      `${this.leadHeader(lead)}\n\n形式：${ACTION_LABELS[action] || '待选'}\n选择要发送的内容：`,
+      `${this.leadHeader(lead)}\n\n形式：${ACTION_LABELS[action] || '待选'}\n选择资料库里的关键词（已有资料，不必再上传）：`,
       action >= 1 && action <= 4 ? Markup.inlineKeyboard(rows).reply_markup : this.leadKeyboard(leadId)
     );
   }
@@ -304,16 +316,16 @@ export class AndroidPanel {
     const chatId = ctx.chat?.id;
     if (!chatId) return;
     const lead = await database.getAndroidCircleLead(leadId);
-    const { contents } = await database.listAndroidMappings();
-    const content = contents[contentIndex];
+    const keyword = await this.keywordByIndex(ctx, contentIndex);
+    const content = keyword ? await resolveContentForKeyword(keyword, await this.mediaScopeUserId(ctx)) : null;
     if (!lead || !content) {
-      await this.render(ctx, '❌ 线索或内容映射已变动，请重新操作。', this.backKeyboard());
+      await this.render(ctx, '❌ 线索或资料已变动，请重新操作。', this.backKeyboard());
       return;
     }
     const tasks = await database.createAndroidSendTasksForCircleLead(leadId, [content], chatId, action);
     await this.render(
       ctx,
-      `${this.leadHeader(lead)}\n\n✅ 任务已排队\n内容：${content.tgKeyword}（${content.appContentIdentifier}）\n` +
+      `${this.leadHeader(lead)}\n\n✅ 任务已排队，Worker 领取后就会执行。\n内容：${content.tgKeyword}\n` +
         `形式：${ACTION_LABELS[action]}\n任务：${tasks[0].taskId}\n\n${await quotaLine()}`,
       Markup.inlineKeyboard([
         [Markup.button.callback('📋 任务队列', 'as:tasks'), Markup.button.callback('🤖 控制台', 'as:menu')]
@@ -331,9 +343,10 @@ export class AndroidPanel {
     );
     await this.render(
       ctx,
-      `📌 用户映射\n${userLines.join('\n') || '（暂无）'}\n\n` +
-        `📌 内容映射\n${contentLines.join('\n') || '（暂无）'}\n\n` +
-        `录入 / 修改仍用命令：\n/binduser 用户标识 | App用户名 | 备注\n/bindcontent 内容ID | TG关键词 | App内容标识`,
+      `📌 用户映射（可选，日常发送不需要）\n${userLines.join('\n') || '（暂无）'}\n\n` +
+        `📌 内容映射（可选；默认直接用资料库关键词在 App 笔记里搜索）\n${contentLines.join('\n') || '（暂无）'}\n\n` +
+        `推荐流程：圈子线索推到 Bot → 引用回复「关键词 1」。\n` +
+        `资料库里已有的人，不必再上传，也不必 /binduser。`,
       this.backKeyboard()
     );
   }

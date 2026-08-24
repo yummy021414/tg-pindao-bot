@@ -282,6 +282,10 @@ export class Database {
     return this.jsonDb.getAndroidCircleLead(leadId);
   }
 
+  async listAndroidCircleLeads(limit = 20): Promise<AndroidCircleLead[]> {
+    return this.jsonDb.listAndroidCircleLeads(limit);
+  }
+
   async createAndroidSendTasksForCircleLead(leadId: string, contents: AndroidAppContent[], requestedByChatId: number, action: AndroidSendAction): Promise<AndroidSendTask[]> {
     return this.jsonDb.createAndroidSendTasksForCircleLead(leadId, contents, requestedByChatId, action);
   }

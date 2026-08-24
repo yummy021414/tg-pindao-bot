@@ -1,6 +1,7 @@
 import { Context } from 'telegraf';
-import { androidSendGuard } from '../config';
+import { androidSendGuard, isSuperAdmin } from '../config';
 import { database } from '../database';
+import { resolveContentForKeyword } from './content';
 
 function messageText(ctx: Context): string {
   return ctx.message && 'text' in ctx.message ? ctx.message.text.trim() : '';
@@ -52,9 +53,14 @@ export class AndroidSendCommands {
       return true;
     }
     const keyword = parts[0];
-    const content = await database.getAndroidAppContentByKeyword(keyword);
+    const scopeUserId = ctx.from?.id && isSuperAdmin(ctx.from.id) ? undefined : ctx.from?.id;
+    const content = await resolveContentForKeyword(keyword, scopeUserId);
     if (!content) {
-      await ctx.reply(`❌ 未找到关键词「${keyword}」的内容映射。请先使用 /bindcontent 录入。`);
+      await ctx.reply(
+        `❌ 资料库没有关键词「${keyword}」。\n` +
+          `这个人的资料已经在机器人里的话，用那个关键词回复即可，例如：轻语 1\n` +
+          `还没有的话先把资料上传到机器人，不用绑定通讯录。`
+      );
       return true;
     }
     const tasks = await database.createAndroidSendTasksForCircleLead(lead.leadId, [content], chatId, action);
@@ -107,18 +113,19 @@ export class AndroidSendCommands {
       await ctx.reply(`❌ 未找到用户映射「${appUserId}」。请先使用 /binduser 录入。`);
       return;
     }
-    const contents = await Promise.all(keywords.map(keyword => database.getAndroidAppContentByKeyword(keyword)));
-    const missing = keywords.filter((_keyword, index) => !contents[index]);
+    const resolved = await Promise.all(keywords.map(keyword => resolveContentForKeyword(keyword)));
+    const missing = keywords.filter((_keyword, index) => !resolved[index]);
     if (missing.length > 0) {
-      await ctx.reply(`❌ 未找到内容映射：${missing.join('、')}\n请先使用 /bindcontent 录入。未创建任何任务。`);
+      await ctx.reply(`❌ 资料库没有这些关键词：${missing.join('、')}\n把资料上传到机器人后即可发送，不必 /bindcontent。未创建任何任务。`);
       return;
     }
+    const contents = resolved.filter((item): item is NonNullable<typeof item> => !!item);
     const chatId = ctx.chat?.id;
     if (!chatId) {
       await ctx.reply('❌ 无法识别当前会话，任务未创建。');
       return;
     }
-    const tasks = await database.createAndroidSendTasks(appUser, contents.filter(Boolean) as any[], chatId);
+    const tasks = await database.createAndroidSendTasks(appUser, contents, chatId);
     await ctx.reply(
       `✅ 已创建 ${tasks.length} 个发送任务，将由单个 Android 执行端顺序处理。\n` +
       `用户：${appUserId}（${appUser.appUserName}）\n内容：${keywords.join('、')}\n` +
