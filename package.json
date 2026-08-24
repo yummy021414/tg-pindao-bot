@@ -17,6 +17,10 @@
     "vault:status": "ts-node scripts/vault-status.ts",
     "vault:probe": "ts-node scripts/vault-probe.ts",
     "vault:reset-coords": "ts-node scripts/vault-reset-coords.ts",
+    "android:worker": "ts-node scripts/android-worker.ts",
+    "android:probe": "ts-node scripts/android-worker.ts --probe",
+    "android:notesync": "ts-node scripts/android-worker.ts --notesync",
+    "android:ui": "node scripts/ui-inspect.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [

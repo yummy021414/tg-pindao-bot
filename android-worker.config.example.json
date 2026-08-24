@@ -1,0 +1,103 @@
+{
+  "_readme": [
+    "选择器取值来自 OPPO PLW110 (1080x2344) 的真机取证，见 data/ui-capture。",
+    "会话页底部工具栏没有 resource-id / content-desc，只能用 tapAt 绝对坐标。",
+    "areaRatio 用来把匹配限制在屏幕某个区域：底部 Tab 的“消息”不加区域限制会误命中聊天里的“[消息自毁]”提示。",
+    "content 的 anchorOffset.absoluteX=75 表示：先按描述命中笔记条目，再点它左侧同一行的勾选圆圈。",
+    "recipientRoutes 按顺序尝试：先在消息列表找已有会话，找不到再去圈子点头像进个人信息页发消息。",
+    "发送入口必须走会话底部的“+”→“笔记”。底部工具栏第三个图标打开的是笔记管理页，选完不会发给当前会话。",
+    "sendAction 的“笔记/展示/位置/三连”不是切换标签：勾选内容后点下去就直接发送并返回会话。",
+    "success 两条要同时命中：标题栏出现对方昵称（说明已退回会话）＋会话里出现该内容的卡片。",
+    "success 填错会导致误判成功，宁可填一个找不到的值让任务判失败，也不要留空。",
+    "整条链路已在真机跑通：dryRun 改 false 后可用 npm run android:probe -- --user X --content Y --live 单独验证。",
+    "noteSync 用于「上传资料 → 同步成 App 笔记」：素材先 adb push 进相册，再按文件名在系统选择器里精确选中。",
+    "noteSync.pickerItem 的 $file 会被换成 tgnote-<taskId>-NN.jpg 这样的文件名；系统选择器一次最多选 9 个，超出会自动分批。",
+    "中文文案需要手机上装 ADBKeyBoard，否则笔记照建但文案会被跳过，并在回执里标注。",
+    "optional: true 的步骤找不到会跳过而不报错。加好友链路：资料页点“添加好友”→ 申请页点“确定”→ 回资料页点“发送消息”进会话；已是好友时资料页没有“添加好友”按钮，两个可选步骤自动跳过。",
+    "不想每次都加好友的话，把两条路线里的“添加好友/确认好友申请”步骤删掉即可（“已有会话”路线还要一并删掉“顶部标题进资料页”和“发送消息”）。"
+  ],
+  "serverUrl": "https://your-vps.example.com",
+  "workerToken": "与 VPS 的 ANDROID_WORKER_TOKEN 保持一致",
+  "workerId": "windows-phone-01",
+  "deviceId": "填写 adb devices 显示的序列号；留空表示唯一连接设备",
+  "appPackage": "com.bangban.cc",
+  "pollIntervalMs": 3000,
+  "waitTimeoutMs": 5000,
+  "scrollAttempts": 4,
+  "screenBase": { "width": 1080, "height": 2344 },
+  "restartApp": true,
+  "dryRun": true,
+  "circleSync": {
+    "enabled": false,
+    "intervalMs": 180000,
+    "entry": { "contentDescContains": "圈子", "areaRatio": { "top": 0.85 } }
+  },
+  "selectors": {
+    "recipientRoutes": [
+      {
+        "name": "已有会话",
+        "steps": [
+          { "label": "消息 Tab", "contentDescContains": "消息", "areaRatio": { "top": 0.85 } },
+          {
+            "label": "会话",
+            "contentDescContains": "$user",
+            "scroll": true,
+            "areaRatio": { "top": 0.12, "bottom": 0.88 }
+          },
+          { "label": "顶部标题进资料页", "tapAt": [540, 205] },
+          { "label": "添加好友", "contentDesc": "添加好友", "optional": true },
+          { "label": "确认好友申请", "contentDesc": "确定", "optional": true },
+          { "label": "发送消息", "contentDesc": "发送消息" }
+        ]
+      },
+      {
+        "name": "圈子现找",
+        "steps": [
+          { "label": "圈子 Tab", "contentDescContains": "圈子", "areaRatio": { "top": 0.85 } },
+          {
+            "label": "该用户的头像",
+            "contentDescContains": "$user",
+            "scroll": true,
+            "within": { "className": "android.widget.ImageView", "clickable": true }
+          },
+          { "label": "添加好友", "contentDesc": "添加好友", "optional": true },
+          { "label": "确认好友申请", "contentDesc": "确定", "optional": true },
+          { "label": "发送消息", "contentDesc": "发送消息" }
+        ]
+      }
+    ],
+    "sharePanelSteps": [
+      { "label": "会话底部的 +", "tapAt": [962, 2200] },
+      { "label": "笔记入口", "contentDesc": "笔记", "areaRatio": { "top": 0.68 } }
+    ],
+    "content": {
+      "contentDescContains": "$content",
+      "scroll": true,
+      "anchorOffset": { "absoluteX": 75 }
+    },
+    "selectedIndicator": { "contentDescContains": "已选 1 条" },
+    "sendAction": { "contentDesc": "$action", "areaRatio": { "top": 0.88 } },
+    "success": [
+      { "contentDescContains": "$user", "areaRatio": { "bottom": 0.15 } },
+      { "contentDescContains": "$content" }
+    ],
+    "cancel": { "contentDesc": "取消" },
+    "noteSync": {
+      "entrySteps": [
+        { "label": "我的 Tab", "tapAt": [970, 2176] },
+        { "label": "我的笔记", "tapAt": [540, 1826] }
+      ],
+      "noteCounter": { "contentDescContains": "条笔记" },
+      "createSteps": [
+        { "label": "右上角加号", "contentDesc": "显示菜单" },
+        { "label": "新增笔记", "contentDesc": "新增笔记" }
+      ],
+      "textBlock": { "contentDesc": "文字", "areaRatio": { "top": 0.75 } },
+      "photoBlock": { "contentDesc": "图片", "areaRatio": { "top": 0.75 } },
+      "videoBlock": { "contentDesc": "视频", "areaRatio": { "top": 0.75 } },
+      "pickerItem": { "contentDescContains": "$file" },
+      "pickerConfirm": { "contentDescContains": "确认", "areaRatio": { "top": 0.88 } },
+      "save": { "tapAt": [1008, 204] }
+    }
+  }
+}

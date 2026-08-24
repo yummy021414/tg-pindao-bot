@@ -5,6 +5,8 @@ import { database } from '../database';
 import { Telegraf } from 'telegraf';
 import axios from 'axios';
 import https from 'https';
+import { androidSendGuard, androidTaskLeaseMs, androidWorkerToken, config } from '../config';
+import { AndroidPanel } from '../androidSend/panel';
 
 // 安全转义函数
 function escapeHtmlAttribute(str: string): string {
@@ -21,6 +23,141 @@ export function startWebServer(bot: Telegraf) {
 
   if (!fs.existsSync(albumsDir)) fs.mkdirSync(albumsDir, { recursive: true });
   app.use('/media', express.static(albumsDir));
+  app.use(express.json({ limit: '32kb' }));
+
+  // 执行端与 VPS 分离时的最小队列 API。令牌未配置时主动关闭，防止公网匿名领取任务。
+  const requireAndroidWorker = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (!androidWorkerToken) {
+      res.status(503).json({ ok: false, error: 'ANDROID_WORKER_TOKEN 未配置，Android 队列接口已禁用' });
+      return;
+    }
+    const authorization = req.header('authorization') || '';
+    if (authorization !== `Bearer ${androidWorkerToken}`) {
+      res.status(401).json({ ok: false, error: '未授权的 Android 执行端' });
+      return;
+    }
+    next();
+  };
+
+  app.get('/api/android/tasks/next', requireAndroidWorker, async (req, res) => {
+    try {
+      const workerId = String(req.query.workerId || '').trim();
+      if (!workerId || workerId.length > 80) {
+        res.status(400).json({ ok: false, error: 'workerId 必填，且不能超过 80 个字符' });
+        return;
+      }
+      const { task, hold } = await database.claimNextAndroidSendTask(workerId, {
+        leaseMs: androidTaskLeaseMs,
+        ...androidSendGuard
+      });
+      res.json({ ok: true, task, hold: hold || null });
+    } catch (error: any) {
+      console.error('[Android 队列] 领取任务失败:', error?.message || error);
+      res.status(500).json({ ok: false, error: '领取任务失败' });
+    }
+  });
+
+  app.post('/api/android/tasks/:taskId/complete', requireAndroidWorker, async (req, res) => {
+    try {
+      const workerId = String(req.body?.workerId || '').trim();
+      const claimToken = String(req.body?.claimToken || '').trim();
+      const success = req.body?.success === true;
+      const errorMessage = typeof req.body?.errorMessage === 'string' ? req.body.errorMessage.slice(0, 500) : undefined;
+      if (!workerId || !claimToken || typeof req.body?.success !== 'boolean') {
+        res.status(400).json({ ok: false, error: 'workerId、claimToken、success 为必填字段' });
+        return;
+      }
+      const task = await database.completeAndroidSendTask(
+        req.params.taskId, workerId, claimToken, success, errorMessage, androidSendGuard
+      );
+      const quota = await database.getAndroidSendQuota(androidSendGuard.dailyLimit);
+      const quotaLine = androidSendGuard.dailyLimit > 0
+        ? `\n今日：${quota.usedToday}/${androidSendGuard.dailyLimit}｜待执行：${quota.pending}`
+        : `\n待执行：${quota.pending}`;
+      const isNoteSync = (task.kind || 'send') === 'noteSync';
+      const result = isNoteSync
+        ? (success
+          ? `✅ App 笔记已同步\n关键词：${task.tgKeyword}\n素材：${task.noteSync?.files.length || 0} 个${quotaLine}`
+          : `❌ App 笔记同步失败\n关键词：${task.tgKeyword}\n原因：${task.errorMessage || '未知错误'}${quotaLine}`)
+        : (success
+          ? `✅ Android 发送成功\n用户：${task.appUserId}\n内容：${task.tgKeyword}${quotaLine}`
+          : `❌ Android 发送失败\n用户：${task.appUserId}\n内容：${task.tgKeyword}\n原因：${task.errorMessage || '未知错误'}${quotaLine}`);
+      await bot.telegram.sendMessage(task.requestedByChatId, result).catch(error => {
+        console.error(`[Android 队列] TG 回执发送失败 (${task.taskId}):`, error?.message || error);
+      });
+      res.json({ ok: true, task });
+    } catch (error: any) {
+      const message = error?.message || '回写任务失败';
+      const status = message.includes('不存在') ? 404 : 409;
+      console.error('[Android 队列] 回写任务失败:', message);
+      res.status(status).json({ ok: false, error: message });
+    }
+  });
+
+  /**
+   * 同步笔记要把素材落到手机相册，执行端得先拿到原始文件。
+   * 走鉴权通道而不是公开的 /proxy，避免素材被无凭据抓取。
+   */
+  app.get('/api/android/media/:fileId', requireAndroidWorker, async (req, res) => {
+    try {
+      const fileLink = await bot.telegram.getFileLink(req.params.fileId);
+      let downloadUrl = fileLink.href;
+      const apiRoot = process.env.TELEGRAM_API_ROOT;
+      if (apiRoot && apiRoot !== 'https://api.telegram.org') {
+        downloadUrl = downloadUrl.replace('https://api.telegram.org', apiRoot);
+      }
+      const response = await axios({
+        method: 'get',
+        url: downloadUrl,
+        responseType: 'stream',
+        timeout: 120000,
+        httpsAgent
+      });
+      res.setHeader('Content-Type', response.headers['content-type'] || 'application/octet-stream');
+      response.data.pipe(res);
+    } catch (error: any) {
+      console.error(`[Android 同步] 素材下载失败 (${req.params.fileId}):`, error?.message || error);
+      res.status(502).json({ ok: false, error: '素材下载失败' });
+    }
+  });
+
+  /**
+   * 圈子扫描只上传“谁发了什么”的线索；服务端把它发给管理员，绝不自动触发私信。
+   * 管理员必须引用该消息并回复“关键词 1..4”才会创建 Android 发送任务。
+   */
+  app.post('/api/android/circle-leads', requireAndroidWorker, async (req, res) => {
+    try {
+      const leads = Array.isArray(req.body?.leads) ? req.body.leads.slice(0, 20) : [];
+      if (leads.length === 0) {
+        res.status(400).json({ ok: false, error: 'leads 必须是非空数组' });
+        return;
+      }
+      if (!config.superAdminId) {
+        res.status(503).json({ ok: false, error: 'SUPER_ADMIN_ID 未配置，无法投递圈子线索' });
+        return;
+      }
+      const created: string[] = [];
+      for (const item of leads) {
+        const appUserName = typeof item?.appUserName === 'string' ? item.appUserName.trim().slice(0, 120) : '';
+        const appUserId = typeof item?.appUserId === 'string' ? item.appUserId.trim().slice(0, 120) : appUserName;
+        const circleContent = typeof item?.circleContent === 'string' ? item.circleContent.trim().slice(0, 1500) : '';
+        if (!appUserId || !appUserName || !circleContent) continue;
+        const { lead, isNew } = await database.saveAndroidCircleLead({ appUserId, appUserName, circleContent });
+        if (!isNew) continue;
+        const sent = await bot.telegram.sendMessage(
+          config.superAdminId,
+          `📥 圈子线索\n用户：${lead.appUserName}\n内容：${lead.circleContent}\n\n点下方按钮发送；也可引用本消息回复「关键词 1」（1=笔记 2=展示 3=位置 4=三连）。`,
+          { reply_markup: AndroidPanel.leadKeyboard(lead.leadId) }
+        );
+        await database.bindAndroidCircleLeadToBotMessage(lead.leadId, sent.chat.id, sent.message_id);
+        created.push(lead.leadId);
+      }
+      res.json({ ok: true, created, skipped: leads.length - created.length });
+    } catch (error: any) {
+      console.error('[Android 圈子] 接收线索失败:', error?.message || error);
+      res.status(500).json({ ok: false, error: '接收圈子线索失败' });
+    }
+  });
 
   // 健康检查 / 首页（避免域名打开只看到空白 404）
   app.get('/', (_req, res) => {

@@ -1,5 +1,16 @@
 import { MediaItem, UserPermission, UserSession, PermissionType } from '../types';
-import { JsonDatabase } from './json-database';
+import {
+  AndroidAppContent,
+  AndroidAppUser,
+  AndroidCircleLead,
+  AndroidClaimResult,
+  AndroidNoteSyncPayload,
+  AndroidSendAction,
+  AndroidSendGuardOptions,
+  AndroidSendQuota,
+  AndroidSendTask,
+  JsonDatabase
+} from './json-database';
 
 export class Database {
   private jsonDb: JsonDatabase;
@@ -194,6 +205,85 @@ export class Database {
 
   async getExpiredAlbums(days: number = 3): Promise<any[]> {
     return this.jsonDb.getExpiredAlbums(days);
+  }
+
+  async upsertAndroidAppUser(input: Omit<AndroidAppUser, 'createdAt' | 'updatedAt'>): Promise<AndroidAppUser> {
+    return this.jsonDb.upsertAndroidAppUser(input);
+  }
+
+  async upsertAndroidAppContent(input: Omit<AndroidAppContent, 'createdAt' | 'updatedAt'>): Promise<AndroidAppContent> {
+    return this.jsonDb.upsertAndroidAppContent(input);
+  }
+
+  async getAndroidAppUser(appUserId: string): Promise<AndroidAppUser | null> {
+    return this.jsonDb.getAndroidAppUser(appUserId);
+  }
+
+  async getAndroidAppContentByKeyword(tgKeyword: string): Promise<AndroidAppContent | null> {
+    return this.jsonDb.getAndroidAppContentByKeyword(tgKeyword);
+  }
+
+  async listAndroidMappings(): Promise<{ users: AndroidAppUser[]; contents: AndroidAppContent[] }> {
+    return this.jsonDb.listAndroidMappings();
+  }
+
+  async createAndroidSendTasks(appUser: AndroidAppUser, contents: AndroidAppContent[], requestedByChatId: number, action?: AndroidSendAction): Promise<AndroidSendTask[]> {
+    return this.jsonDb.createAndroidSendTasks(appUser, contents, requestedByChatId, action);
+  }
+
+  async createAndroidNoteSyncTask(payload: AndroidNoteSyncPayload, requestedByChatId: number): Promise<AndroidSendTask> {
+    return this.jsonDb.createAndroidNoteSyncTask(payload, requestedByChatId);
+  }
+
+  async getAndroidNoteSyncOnUpload(defaultValue: boolean): Promise<boolean> {
+    return this.jsonDb.getAndroidNoteSyncOnUpload(defaultValue);
+  }
+
+  async setAndroidNoteSyncOnUpload(value: boolean): Promise<void> {
+    return this.jsonDb.setAndroidNoteSyncOnUpload(value);
+  }
+
+  async claimNextAndroidSendTask(workerId: string, options: AndroidSendGuardOptions): Promise<AndroidClaimResult> {
+    return this.jsonDb.claimNextAndroidSendTask(workerId, options);
+  }
+
+  async completeAndroidSendTask(
+    taskId: string,
+    workerId: string,
+    claimToken: string,
+    success: boolean,
+    errorMessage?: string,
+    cooldown?: { minIntervalMs: number; maxIntervalMs: number }
+  ): Promise<AndroidSendTask> {
+    return this.jsonDb.completeAndroidSendTask(taskId, workerId, claimToken, success, errorMessage, cooldown);
+  }
+
+  async getAndroidSendQuota(dailyLimit: number): Promise<AndroidSendQuota> {
+    return this.jsonDb.getAndroidSendQuota(dailyLimit);
+  }
+
+  async listAndroidSendTasks(limit: number = 20): Promise<AndroidSendTask[]> {
+    return this.jsonDb.listAndroidSendTasks(limit);
+  }
+
+  async saveAndroidCircleLead(input: Omit<AndroidCircleLead, 'leadId' | 'capturedAt' | 'botChatId' | 'botMessageId'>) {
+    return this.jsonDb.saveAndroidCircleLead(input);
+  }
+
+  async bindAndroidCircleLeadToBotMessage(leadId: string, botChatId: number, botMessageId: number): Promise<void> {
+    return this.jsonDb.bindAndroidCircleLeadToBotMessage(leadId, botChatId, botMessageId);
+  }
+
+  async getAndroidCircleLeadByBotMessage(botChatId: number, botMessageId: number): Promise<AndroidCircleLead | null> {
+    return this.jsonDb.getAndroidCircleLeadByBotMessage(botChatId, botMessageId);
+  }
+
+  async getAndroidCircleLead(leadId: string): Promise<AndroidCircleLead | null> {
+    return this.jsonDb.getAndroidCircleLead(leadId);
+  }
+
+  async createAndroidSendTasksForCircleLead(leadId: string, contents: AndroidAppContent[], requestedByChatId: number, action: AndroidSendAction): Promise<AndroidSendTask[]> {
+    return this.jsonDb.createAndroidSendTasksForCircleLead(leadId, contents, requestedByChatId, action);
   }
 
   async close(): Promise<void> {
