@@ -20,6 +20,7 @@
   "serverUrl": "https://your-vps.example.com",
   "workerToken": "与 VPS 的 ANDROID_WORKER_TOKEN 保持一致",
   "workerId": "windows-phone-01",
+  "adbPath": "C:\\Users\\你\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe",
   "deviceId": "填写 adb devices 显示的序列号；留空表示唯一连接设备",
   "appPackage": "com.bangban.cc",
   "pollIntervalMs": 3000,

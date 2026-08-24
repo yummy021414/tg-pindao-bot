@@ -186,12 +186,32 @@ if (!isLocalProbe && (!config.serverUrl || !config.workerToken || !config.worker
 
 const ACTION_LABELS = { 1: '笔记', 2: '展示', 3: '位置', 4: '三连' } as const;
 
+function resolveAdbPath(): string {
+  const exe = process.platform === 'win32' ? 'adb.exe' : 'adb';
+  const candidates = [
+    config.adbPath,
+    process.env.ADB_PATH,
+    path.join(process.env.LOCALAPPDATA || '', 'Android', 'Sdk', 'platform-tools', exe),
+    path.join(process.env.ANDROID_HOME || '', 'platform-tools', exe),
+    path.join(process.env.ANDROID_SDK_ROOT || '', 'platform-tools', exe),
+    path.join(process.env.USERPROFILE || '', 'AppData', 'Local', 'Android', 'Sdk', 'platform-tools', exe)
+  ].filter((item): item is string => !!item);
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error(
+    '找不到 adb。请安装 Android platform-tools，或在 android-worker.config.json 里填写 adbPath（例如 C:\\\\Users\\\\你\\\\AppData\\\\Local\\\\Android\\\\Sdk\\\\platform-tools\\\\adb.exe）。'
+  );
+}
+
+const adbBin = resolveAdbPath();
+
 function adbArgs(args: string[]): string[] {
   return config.deviceId ? ['-s', config.deviceId, ...args] : args;
 }
 
 async function adb(...args: string[]): Promise<string> {
-  const result = await execFileAsync(config.adbPath || 'adb', adbArgs(args), { windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
+  const result = await execFileAsync(adbBin, adbArgs(args), { windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
   return result.stdout;
 }
 
@@ -940,7 +960,7 @@ async function main(): Promise<void> {
     return;
   }
   const pollIntervalMs = config.pollIntervalMs || 3000;
-  console.log(`[Android Worker] 已启动：${config.workerId}，设备：${config.deviceId || '默认设备'}${config.dryRun ? '（演练模式，不会真正发送）' : ''}`);
+  console.log(`[Android Worker] 已启动：${config.workerId}，设备：${config.deviceId || '默认设备'}，adb：${adbBin}${config.dryRun ? '（演练模式，不会真正发送）' : ''}`);
   let lastCircleSyncAt = 0;
   while (true) {
     try {
