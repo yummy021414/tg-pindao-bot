@@ -29,6 +29,8 @@ export interface UserSession {
   pendingMedia?: any[];
   pendingText?: string;
   selectedChannel?: string;
+  // 多选目标。selectedChannel 保留为首个目标，兼容已有会话和旧发布记录。
+  selectedChannels?: string[];
   targetUserId?: number;
   targetUserDisplay?: string;
   pendingButtonData?: {

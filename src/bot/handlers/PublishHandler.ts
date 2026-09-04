@@ -28,6 +28,16 @@ export class PublishHandler {
     }
   }
 
+  private static getSelectedChannels(session: UserSession | null | undefined): string[] {
+    if (!session) return [];
+    const channels = session.selectedChannels?.length
+      ? session.selectedChannels
+      : session.selectedChannel
+        ? [session.selectedChannel]
+        : [];
+    return Array.from(new Set(channels.map(String).filter(Boolean)));
+  }
+
   static async handleKeywordInput(
     ctx: Context, 
     keyword: string, 
@@ -39,13 +49,14 @@ export class PublishHandler {
     if (!userId) return;
 
     const session = userSessions.get(userId);
+    const selectedChannels = this.getSelectedChannels(session);
     console.log(
-      `📢 [发布] 收到输入="${keyword}" | mode=${session?.mode} step=${session?.step} channel=${session?.selectedChannel ?? '无'}`
+      `📢 [发布] 收到输入="${keyword}" | mode=${session?.mode} step=${session?.step} channels=${selectedChannels.join(',') || '无'}`
     );
 
-    if (!session || session.mode !== 'publish' || !session.selectedChannel) {
+    if (!session || session.mode !== 'publish' || selectedChannels.length === 0) {
       console.warn(
-        `📢 [发布] 静默跳过：session=${!!session} mode=${session?.mode} selectedChannel=${session?.selectedChannel ?? '无'}`
+        `📢 [发布] 静默跳过：session=${!!session} mode=${session?.mode} selectedChannels=${selectedChannels.join(',') || '无'}`
       );
       return;
     }
@@ -111,8 +122,12 @@ export class PublishHandler {
           : '🔍 正在搜索并发布...'
       );
 
-      const channelId = session.selectedChannel!;
-      const results: Array<{ kw: string; count: number; ok: boolean }> = [];
+      const channelIds = this.getSelectedChannels(session);
+      if (channelIds.length === 0) {
+        await this.safeReply(ctx, '❌ 请先选择至少一个目标群或频道。');
+        return;
+      }
+      const results: Array<{ kw: string; count: number; ok: boolean; missing: boolean; failedChannels: string[] }> = [];
       let totalPublished = 0;
 
       for (let ki = 0; ki < keywords.length; ki++) {
@@ -120,7 +135,7 @@ export class PublishHandler {
         const mediaItems = await db.getMediaByKeyword(kw, scopeUserId);
 
         if (mediaItems.length === 0) {
-          results.push({ kw, count: 0, ok: false });
+          results.push({ kw, count: 0, ok: false, missing: true, failedChannels: [] });
           console.warn(`📢 [发布] 跳过未找到的关键词: "${kw}"`);
           await this.safeReply(ctx, `⚠️ 「${kw}」库里没有资料，已跳过`);
           continue;
@@ -141,25 +156,46 @@ export class PublishHandler {
           `（组与组之间有间隔，资料多时请耐心等，完成后会提示）`
         );
 
-        const publishedCount = await this.publishToChannel(bot, channelId, mediaItems, kw, async (done, total) => {
-          if (done === total || done % 5 === 0) {
-            console.log(`📢 [发布进度] "${kw}" ${done}/${total} 组`);
+        const successes: Array<{ channelId: string; count: number }> = [];
+        const failedChannels: string[] = [];
+        for (let channelIndex = 0; channelIndex < channelIds.length; channelIndex++) {
+          const channelId = channelIds[channelIndex];
+          try {
+            const publishedCount = await this.publishToChannel(bot, channelId, mediaItems, kw, async (done, total) => {
+              if (done === total || done % 5 === 0) {
+                console.log(`📢 [发布进度] "${kw}" → ${channelId} ${done}/${total} 组`);
+              }
+            });
+            successes.push({ channelId, count: publishedCount });
+            recordPublishEvent({
+              keyword: kw,
+              userId,
+              channelId,
+              source: 'publish',
+              count: publishedCount
+            });
+          } catch (error: any) {
+            failedChannels.push(channelId);
+            console.error(`📢 [发布] "${kw}" 发往 ${channelId} 失败:`, error?.message || error);
           }
-        });
-
-        for (const item of mediaItems) {
-          await db.updateMediaPublished(item.id, channelId);
+          if (channelIndex < channelIds.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 1200));
+          }
         }
 
-        recordPublishEvent({
-          keyword: kw,
-          userId,
-          channelId,
-          source: 'publish',
-          count: publishedCount
-        });
+        if (successes.length === 0) {
+          results.push({ kw, count: 0, ok: false, missing: false, failedChannels });
+          await this.safeReply(ctx, `⚠️ 「${kw}」发送到所有目标均失败，已继续处理下一个关键词。`);
+          continue;
+        }
 
-        results.push({ kw, count: publishedCount, ok: true });
+        // 资料条目仍保留一个主发布频道，兼容现有统计与筛选；审计日志会记录全部目标。
+        for (const item of mediaItems) {
+          await db.updateMediaPublished(item.id, successes[0].channelId);
+        }
+
+        const publishedCount = successes.reduce((sum, item) => sum + item.count, 0);
+        results.push({ kw, count: publishedCount, ok: true, missing: false, failedChannels });
         totalPublished += publishedCount;
 
         if (ki < keywords.length - 1) {
@@ -172,13 +208,14 @@ export class PublishHandler {
       userSessions.set(userId, session);
       await db.saveUserSession(userId, session);
 
-      const channelName = await this.getChannelName(bot, channelId);
+      const channelNames = await Promise.all(channelIds.map(channelId => this.getChannelName(bot, channelId)));
       const okList = results.filter(r => r.ok);
-      const missList = results.filter(r => !r.ok);
+      const missList = results.filter(r => r.missing);
+      const failedList = results.filter(r => !r.ok && !r.missing);
 
       let summary =
         `✅ 发布完成！\n\n` +
-        `目标频道: ${channelName}\n` +
+        `目标群/频道（${channelNames.length}）：\n${channelNames.map(name => `• ${name}`).join('\n')}\n` +
         `输入: 「${keyword}」\n` +
         `成功关键词: ${okList.length}/${keywords.length}\n` +
         `共发布 ${totalPublished} 个媒体文件\n`;
@@ -188,6 +225,15 @@ export class PublishHandler {
       }
       if (missList.length > 0) {
         summary += `\n未找到：\n` + missList.map(r => `• ${r.kw}`).join('\n') + '\n';
+      }
+      if (failedList.length > 0) {
+        summary += `\n发送失败：\n` + failedList.map(r => `• ${r.kw}`).join('\n') + '\n';
+      }
+      const partialFailures = results.filter(result => result.failedChannels.length > 0);
+      if (partialFailures.length > 0) {
+        summary += `\n部分目标发送失败：\n` + partialFailures
+          .map(result => `• ${result.kw}：${result.failedChannels.join('、')}`)
+          .join('\n') + '\n';
       }
 
       summary +=
@@ -219,7 +265,8 @@ export class PublishHandler {
     if (!userId) return;
 
     const session = userSessions.get(userId);
-    if (!session || session.mode !== 'publish' || !session.selectedChannel || !session.currentKeyword) {
+    const channelIds = this.getSelectedChannels(session);
+    if (!session || session.mode !== 'publish' || channelIds.length === 0 || !session.currentKeyword) {
       return;
     }
 
@@ -235,23 +282,28 @@ export class PublishHandler {
       }
 
       // 发布到频道
-      const publishedCount = await this.publishToChannel(
-        bot, 
-        session.selectedChannel, 
-        mediaItems, 
-        session.currentKeyword
-      );
+      const successfulChannels: string[] = [];
+      let publishedCount = 0;
+      for (const channelId of channelIds) {
+        try {
+          publishedCount += await this.publishToChannel(bot, channelId, mediaItems, session.currentKeyword);
+          successfulChannels.push(channelId);
+        } catch (error) {
+          console.error(`发布到频道 ${channelId} 失败:`, error);
+        }
+      }
+      if (successfulChannels.length === 0) throw new Error('所有目标频道均发送失败');
 
-      // 更新数据库中的发布状态
+      // 更新数据库中的发布状态（保留首个成功目标，兼容旧数据结构）
       for (const item of mediaItems) {
-        await db.updateMediaPublished(item.id, session.selectedChannel);
+        await db.updateMediaPublished(item.id, successfulChannels[0]);
       }
 
       const publishedKeyword = session.currentKeyword; // 保存当前关键词用于显示
       recordPublishEvent({
         keyword: publishedKeyword,
         userId,
-        channelId: session.selectedChannel,
+        channelId: successfulChannels[0],
         source: 'publish',
         count: publishedCount
       });
@@ -265,7 +317,7 @@ export class PublishHandler {
       await ctx.reply(
         `✅ 发布完成！\n\n` +
         `关键词: "${publishedKeyword}"\n` +
-        `目标频道: ${await this.getChannelName(bot, session.selectedChannel)}\n` +
+        `目标频道: ${(await Promise.all(successfulChannels.map(channelId => this.getChannelName(bot, channelId)))).join('、')}\n` +
         `已发布 ${publishedCount} 个媒体文件\n\n` +
         `🔄 发布模式仍然激活\n` +
         `💡 继续输入下一个关键词进行发布，或点击取消退出发布模式。`,

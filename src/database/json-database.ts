@@ -13,6 +13,13 @@ interface UserInfo {
   album_auth_expires?: string; // 🚀 新增：相册授权到期时间
 }
 
+interface ChatMessageRecord {
+  senderId: number;
+  recipientId: number;
+  content: string;
+  createdAt: string;
+}
+
 interface DatabaseData {
   media: MediaItem[];
   userPermissions: UserPermission[];
@@ -22,6 +29,7 @@ interface DatabaseData {
   channels?: string[]; // 新增：动态添加的频道ID
   albums?: { [albumId: string]: any }; // 新增：存储生成的相册数据
   recommendedTags?: string[]; // 新增：推荐标签
+  chatMessages?: ChatMessageRecord[];
 }
 
 export class JsonDatabase {
@@ -30,7 +38,8 @@ export class JsonDatabase {
     media: [],
     userPermissions: [],
     userSessions: {},
-    users: [] // 新增
+    users: [], // 新增
+    chatMessages: []
   };
 
   constructor() {
@@ -69,7 +78,8 @@ export class JsonDatabase {
           joinWelcomeConfig: loadedData.joinWelcomeConfig || undefined,
           channels: Array.isArray(loadedData.channels) ? loadedData.channels : [],
           albums: this.normalizeObjectMap(loadedData.albums),
-          recommendedTags: loadedData.recommendedTags || ['W⬆️', '5⬆️', '静安', '黄浦', 'VIP']
+          recommendedTags: loadedData.recommendedTags || ['W⬆️', '5⬆️', '静安', '黄浦', 'VIP'],
+          chatMessages: Array.isArray(loadedData.chatMessages) ? loadedData.chatMessages : []
         };
 
         // 主库 media 空但有 fallback 时自动恢复（保存失败过的场景）
@@ -106,7 +116,8 @@ export class JsonDatabase {
           users: [],
           joinWelcomeConfig: undefined,
           channels: [],
-          albums: {}
+          albums: {},
+          chatMessages: []
         };
         this.saveData();
         console.log('✅ 创建新的JSON数据库');
@@ -120,7 +131,8 @@ export class JsonDatabase {
         users: [],
         joinWelcomeConfig: undefined,
         channels: [],
-        albums: {}
+          albums: {},
+          chatMessages: []
       };
     }
   }
@@ -168,7 +180,8 @@ export class JsonDatabase {
       joinWelcomeConfig: this.data.joinWelcomeConfig,
       channels: Array.isArray(this.data.channels) ? this.data.channels : [],
       albums,
-      recommendedTags: this.data.recommendedTags || []
+      recommendedTags: this.data.recommendedTags || [],
+      chatMessages: this.data.chatMessages || []
     };
     return JSON.stringify(payload);
   }
@@ -860,12 +873,33 @@ export class JsonDatabase {
   }
 
   async getChatUsers(): Promise<any[]> {
-    // 简单实现：返回空数组
-    return [];
+    const latestByUser = new Map<number, string>();
+    for (const message of this.data.chatMessages || []) {
+      const userId = message.senderId === config.superAdminId
+        ? message.recipientId
+        : message.senderId;
+      if (userId === config.superAdminId) continue;
+      const previous = latestByUser.get(userId);
+      if (!previous || message.createdAt > previous) {
+        latestByUser.set(userId, message.createdAt);
+      }
+    }
+    return Array.from(latestByUser.entries())
+      .map(([user_id, last_message_time]) => ({ user_id, last_message_time }))
+      .sort((a, b) => b.last_message_time.localeCompare(a.last_message_time));
   }
 
-  async saveChatMessage(userId: number, messageId: number, content: string): Promise<void> {
-    // 简单实现：不做任何操作
+  async saveChatMessage(senderId: number, recipientId: number, content: string): Promise<void> {
+    const messages = this.data.chatMessages || (this.data.chatMessages = []);
+    messages.push({
+      senderId,
+      recipientId,
+      content: String(content || '').slice(0, 4000),
+      createdAt: new Date().toISOString()
+    });
+    // 聊天记录需要立即可见，不能等待防抖写盘后才出现在管理员列表中。
+    if (messages.length > 5000) messages.splice(0, messages.length - 5000);
+    await this.saveImmediately();
   }
 
   async getAllActiveUsers(): Promise<any[]> {

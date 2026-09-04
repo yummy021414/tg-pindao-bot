@@ -402,10 +402,19 @@ export class UploadHandler {
     userSessions: Map<number, UserSession>,
     bot: Telegraf
   ): Promise<void> {
+    await this.renderChannelSelection(ctx, userSessions, bot, false);
+  }
+
+  static async renderChannelSelection(
+    ctx: Context,
+    userSessions: Map<number, UserSession>,
+    bot: Telegraf,
+    editExisting: boolean
+  ): Promise<void> {
     const userId = ctx.from?.id;
     if (!userId) return;
 
-    await ctx.answerCbQuery('加载频道列表…').catch(() => {});
+    if (!editExisting) await ctx.answerCbQuery('加载频道列表…').catch(() => {});
 
     const session = await this.resolveUploadSession(userId, userSessions, database);
     if (!session || !this.isUploadSession(session) || !session.pendingMedia?.length) {
@@ -413,17 +422,29 @@ export class UploadHandler {
       return;
     }
 
-    session.step = 'confirming';
+    session.step = 'selecting_channel';
     userSessions.set(userId, session);
+    await database.saveUserSession(userId, session);
 
     const adminChannelIds = hasAdminChannelMap(userId)
       ? getAdminChannelIds(userId)
       : await database.getManagedChannels();
+    const selected = new Set(
+      (session.selectedChannels?.length ? session.selectedChannels : session.selectedChannel ? [session.selectedChannel] : [])
+        .map(String)
+    );
     const channelButtons = await Promise.all(
-      adminChannelIds.map(async channelId => 
-        [{ text: await this.getChannelFullName(bot, channelId), callback_data: `upload_channel_${channelId}` }]
+      adminChannelIds.map(async channelId => [
+        {
+          text: `${selected.has(String(channelId)) ? '✅ ' : '☐ '}${await this.getChannelFullName(bot, channelId)}`,
+          callback_data: `upload_toggle_${channelId}`
+        }
+      ]
       )
     );
+    if (selected.size > 0) {
+      channelButtons.push([{ text: `✅ 确认 ${selected.size} 个目标`, callback_data: 'upload_channels_confirm' }]);
+    }
     channelButtons.push([{ text: '💾 仅保存到数据库', callback_data: 'save_only' }]);
 
     // 确认前再同步各组文案
@@ -438,25 +459,27 @@ export class UploadHandler {
       `关键词: <code>${kw}</code>\n` +
       `媒体: <b>${groupCount}</b> 组 / <b>${session.pendingMedia.length}</b> 个文件\n\n` +
       `<b>各组文案：</b>\n${captionSummary}\n\n` +
-      `请选择操作：`;
+      `请选择一个或多个目标群/频道：`;
     const briefText =
       `📤 <b>上传确认</b>\n\n` +
       `关键词: <code>${kw}</code>\n` +
       `媒体: <b>${groupCount}</b> 组 / <b>${session.pendingMedia.length}</b> 个文件\n\n` +
-      `请选择操作：`;
+      `请选择一个或多个目标群/频道：`;
     const markup = { parse_mode: 'HTML' as const, reply_markup: { inline_keyboard: channelButtons } };
     try {
-      await ctx.reply(this.sanitizeTelegramText(fullText), markup);
+      if (editExisting) await ctx.editMessageText(this.sanitizeTelegramText(fullText), markup);
+      else await ctx.reply(this.sanitizeTelegramText(fullText), markup);
     } catch (error: any) {
-      console.warn('[上传] 确认页详细文案失败，改发简版:', error?.message || error);
+      console.warn('[上传] 频道选择详细文案失败，改发简版:', error?.message || error);
       try {
-        await ctx.reply(this.sanitizeTelegramText(briefText), markup);
+        if (editExisting) await ctx.editMessageText(this.sanitizeTelegramText(briefText), markup);
+        else await ctx.reply(this.sanitizeTelegramText(briefText), markup);
       } catch (error2: any) {
-        console.error('[上传] 确认页发送失败:', error2?.message || error2);
+        console.error('[上传] 频道选择发送失败:', error2?.message || error2);
         await this.safeNotifyUser(
           ctx.telegram,
           ctx.chat?.id || userId,
-          `📤 上传确认\n\n关键词: ${session.currentKeyword}\n媒体: ${groupCount} 组 / ${session.pendingMedia.length} 个文件\n\n请选择操作：`,
+          `📤 选择目标\n\n关键词: ${session.currentKeyword}\n媒体: ${groupCount} 组 / ${session.pendingMedia.length} 个文件\n\n请选择一个或多个目标群/频道：`,
           { reply_markup: { inline_keyboard: channelButtons } }
         );
       }
@@ -594,10 +617,17 @@ export class UploadHandler {
     await ctx.answerCbQuery('处理中…').catch(() => {});
 
     const session = await this.resolveUploadSession(userId, userSessions, db);
-    if (!session || !this.isUploadSession(session) || !session.pendingMedia?.length || !session.currentKeyword || !session.selectedChannel) {
+    const selectedChannels = session?.selectedChannels?.length
+      ? Array.from(new Set(session.selectedChannels.map(String).filter(Boolean)))
+      : session?.selectedChannel
+        ? [session.selectedChannel]
+        : [];
+    if (!session || !this.isUploadSession(session) || !session.pendingMedia?.length || !session.currentKeyword || selectedChannels.length === 0) {
       await ctx.reply('❌ 上传会话已失效，请重新：上传资料 → 关键词 → 媒体 → 选择频道。');
       return;
     }
+    session.selectedChannels = selectedChannels;
+    session.selectedChannel = selectedChannels[0];
 
     const chatId = ctx.chat?.id || userId;
     let processingMsg: { message_id: number } | null = null;
@@ -608,6 +638,7 @@ export class UploadHandler {
     const sessionSnap = {
       currentKeyword: session.currentKeyword,
       selectedChannel: session.selectedChannel,
+      selectedChannels: session.selectedChannels,
       pendingMedia: JSON.parse(JSON.stringify(session.pendingMedia)),
       pendingText: session.pendingText,
       mode: session.mode
@@ -645,6 +676,7 @@ export class UploadHandler {
     sessionSnap: {
       currentKeyword: string;
       selectedChannel: string;
+      selectedChannels: string[];
       pendingMedia: any[];
       pendingText?: string;
       mode: string;
@@ -700,7 +732,7 @@ export class UploadHandler {
       // 先发金库锁定 source_*，再发业务频道（业务频道不得覆盖金库坐标）
       const persistentChannelId = getAdminPersistentChannelId(userId);
       let vaultNote = '';
-      if (persistentChannelId && persistentChannelId !== session.selectedChannel) {
+      if (persistentChannelId && !session.selectedChannels.includes(persistentChannelId)) {
         console.log(`📡 [影子备份] 发布前同步到永久仓库...`);
         try {
           await this.publishToChannel(bot, persistentChannelId, savedItems, session.currentKeyword, db, {
@@ -715,20 +747,37 @@ export class UploadHandler {
         }
       }
 
-      // 发布到目标频道：仅在尚无坐标时回填（例如未配金库）
-      await this.publishToChannel(bot, session.selectedChannel, savedItems, session.currentKeyword, db, {
-        writeSource: true,
-        forceSource: persistentChannelId === session.selectedChannel,
-        requireSuccess: true
-      });
-
-      recordPublishEvent({
-        keyword: session.currentKeyword,
-        userId,
-        channelId: session.selectedChannel,
-        source: 'save_and_publish',
-        count: savedCount
-      });
+      // 按所选目标逐个同步发布。单个目标失败不阻止其余群/频道继续发送。
+      const publishResults: Array<{ channelId: string; sent: number }> = [];
+      const publishFailures: Array<{ channelId: string; error: string }> = [];
+      for (let index = 0; index < session.selectedChannels.length; index++) {
+        const channelId = session.selectedChannels[index];
+        try {
+          const result = await this.publishToChannel(bot, channelId, savedItems, session.currentKeyword, db, {
+            writeSource: true,
+            forceSource: persistentChannelId === channelId,
+            requireSuccess: true
+          });
+          publishResults.push({ channelId, sent: result.sent });
+          recordPublishEvent({
+            keyword: session.currentKeyword,
+            userId,
+            channelId,
+            source: 'save_and_publish',
+            count: result.sent
+          });
+        } catch (error: any) {
+          const detail = error?.message || String(error);
+          publishFailures.push({ channelId, error: detail });
+          console.error(`保存并发布到 ${channelId} 失败:`, detail);
+        }
+        if (index < session.selectedChannels.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 1200));
+        }
+      }
+      if (publishResults.length === 0) {
+        throw new Error(`无法发布到所选目标：${publishFailures.map(item => `${item.channelId}（${item.error}）`).join('；')}`);
+      }
 
       // 清理会话
       userSessions.delete(userId);
@@ -739,12 +788,15 @@ export class UploadHandler {
       }
 
       const groupCount = this.countBatches(savedItems);
-      const channelName = await this.getChannelName(bot, session.selectedChannel);
+      const channelNames = await Promise.all(publishResults.map(item => this.getChannelName(bot, item.channelId)));
       const completionMsg = `✅ 保存并发布完成！\n\n` +
         `关键词: "${session.currentKeyword}"\n` +
-        `频道: ${channelName}\n` +
+        `已发送目标（${channelNames.length}/${session.selectedChannels.length}）：\n${channelNames.map(name => `• ${name}`).join('\n')}\n` +
         `已处理 ${groupCount} 组 / ${savedCount} 个媒体文件` +
         `${vaultNote}\n\n` +
+        (publishFailures.length
+          ? `⚠️ 以下目标发送失败：\n${publishFailures.map(item => `• ${item.channelId}`).join('\n')}\n\n`
+          : '') +
         `💡 多组已分开发布，不会并成一组。`;
       const completionKbd = { inline_keyboard: [[{ text: '🏠 返回主菜单', callback_data: 'back_to_main' }]] };
 

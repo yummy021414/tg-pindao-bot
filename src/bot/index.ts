@@ -332,6 +332,10 @@ export class TelegramBot {
         this.bot.action('preview_button_maker', this.handlePreviewButtonMaker.bind(this));
 
     // 频道选择
+    this.bot.action(/^publish_toggle_/, this.handlePublishChannelToggle.bind(this));
+    this.bot.action('publish_channels_confirm', this.handlePublishChannelsConfirm.bind(this));
+    this.bot.action(/^upload_toggle_/, this.handleUploadChannelToggle.bind(this));
+    this.bot.action('upload_channels_confirm', this.handleUploadChannelsConfirm.bind(this));
     this.bot.action(/^channel_/, this.handleChannelSelect.bind(this));
     this.bot.action(/^upload_channel_/, this.handleUploadChannelSelect.bind(this));
     // 上传确认
@@ -610,7 +614,7 @@ export class TelegramBot {
     };
     this.userSessions.set(userId, session);
     await database.saveUserSession(userId, session);
-        await ctx.reply(`🚀 发布内容\n\n请选择目标频道：`, await this.getChannelSelectionKeyboard(userId));
+        await ctx.reply(`🚀 发布内容\n\n请选择一个或多个目标群/频道：`, await this.getChannelSelectionKeyboard(userId));
   }
     async handleCheckMedia(ctx: Context) {
     const userId = ctx.from?.id;
@@ -883,6 +887,7 @@ export class TelegramBot {
       };
       this.userSessions.set(userId, session);
       await database.saveUserSession(userId, session);
+      await database.saveChatMessage(userId, config.superAdminId, '[发起聊天请求]');
             await ctx.reply(`💬 聊天模式已开启\n\n` +
         `您现在可以直接发送消息与管理员聊天。\n` +
         `管理员将收到您的消息并可以直接引用回复。\n\n` +
@@ -896,7 +901,7 @@ export class TelegramBot {
         const username = ctx.from?.username ? ` (@${ctx.from.username})` : '';
         const fullName = `${firstName} ${lastName}`.trim() || '用户';
         
-        await this.bot.telegram.sendMessage(config.superAdminId, `💬 <b>新的聊天请求</b>\n\n` +
+        const sentMessage = await this.bot.telegram.sendMessage(config.superAdminId, `💬 <b>新的聊天请求</b>\n\n` +
           `👤 <b>用户</b>：${fullName}${username}\n` +
           `🆔 <b>ID</b>：<code>${userId}</code>\n\n` +
           `✅ <b>已开启聊天模式</b>\n` +
@@ -908,6 +913,8 @@ export class TelegramBot {
               ]
             }
         });
+        // 请求卡本身也可以被管理员直接引用回复，不能只关联后续转发的聊天消息。
+        this.adminMessageToUserMap.set(sentMessage.message_id, userId);
     }
     catch (error) {
         console.error('通知管理员失败:', error);
@@ -963,6 +970,25 @@ export class TelegramBot {
       await ctx.reply('❌ 消息处理失败，请稍后重试');
     }
   }
+    private getAdminReplyTargetUserId(ctx: Context): number | null {
+      if (!ctx.message || !('reply_to_message' in ctx.message) || !ctx.message.reply_to_message) {
+        return null;
+      }
+      const replied = ctx.message.reply_to_message as any;
+      const mappedUserId = this.adminMessageToUserMap.get(replied.message_id);
+      if (mappedUserId) return mappedUserId;
+
+      // Bot 重启后内存映射会消失；新聊天请求卡依然带有用户 ID，可用作可靠兜底。
+      const body = typeof replied.text === 'string'
+        ? replied.text
+        : typeof replied.caption === 'string'
+          ? replied.caption
+          : '';
+      const match = body.match(/(?:\bID\b|用户\s*ID)\s*[：:]\s*(\d{4,})/i)
+        || body.match(/\bID\b\D{0,16}(\d{4,})/i);
+      return match ? Number(match[1]) : null;
+    }
+
     async handleAdminReply(ctx: Context, text: any) {
     if (!ctx.message || !('reply_to_message' in ctx.message) || !ctx.message.reply_to_message) {
       return;
@@ -970,22 +996,10 @@ export class TelegramBot {
     try {
       // 获取被回复消息的ID
       const repliedMessageId = ctx.message.reply_to_message.message_id;
-      // 从消息ID映射中获取目标用户ID
-      const targetUserId = this.adminMessageToUserMap.get(repliedMessageId);
-            let finalTargetUserId;
-      if (targetUserId) {
-        finalTargetUserId = targetUserId;
-            }
-            else {
-        // 尝试从消息文本中提取用户ID（备用方案）
-        const replyMessage = ctx.message.reply_to_message;
-        const messageText = ('text' in replyMessage) ? replyMessage.text || '' : '';
-        const userIdMatch = messageText.match(/ID: (\d+)/);
-        if (!userIdMatch) {
-          await ctx.reply('❌ 无法识别回复目标用户，请确认回复的是用户消息');
-          return;
-        }
-        finalTargetUserId = parseInt(userIdMatch[1]);
+      const finalTargetUserId = this.getAdminReplyTargetUserId(ctx);
+      if (!finalTargetUserId) {
+        await ctx.reply('❌ 无法识别回复目标用户，请引用用户转发消息或“新的聊天请求”通知。');
+        return;
       }
       // 保存管理员消息到数据库
       await database.saveChatMessage(config.superAdminId, finalTargetUserId, text);
@@ -996,9 +1010,7 @@ export class TelegramBot {
         
         await ctx.reply(`✅ 消息已发送给用户 ${finalTargetUserId}`);
         // 清理已使用的消息映射
-        if (targetUserId) {
-          this.adminMessageToUserMap.delete(repliedMessageId);
-        }
+        this.adminMessageToUserMap.delete(repliedMessageId);
       }
             catch (error) {
         await ctx.reply(`❌ 发送失败，用户 ${finalTargetUserId} 可能已停止机器人`);
@@ -1180,6 +1192,147 @@ export class TelegramBot {
     await database.clearUserSession(userId);
         await ctx.reply('🤖 频道管理机器人\n\n请选择功能：', await this.getCoreFunctionKeyboard(userId));
   }
+    private getSelectedChannels(session: UserSession): string[] {
+      const selected = session.selectedChannels?.length
+        ? session.selectedChannels
+        : session.selectedChannel
+          ? [session.selectedChannel]
+          : [];
+      return Array.from(new Set(selected.map(String).filter(Boolean)));
+    }
+
+    private async getAvailableChannels(userId: number): Promise<string[]> {
+      const channelIds = hasAdminChannelMap(userId)
+        ? getAdminChannelIds(userId)
+        : await database.getManagedChannels();
+      return Array.from(new Set(channelIds.map(String).filter(Boolean)));
+    }
+
+    private async getSelectedChannelNames(channelIds: string[]): Promise<string[]> {
+      return Promise.all(channelIds.map(channelId => this.getChannelFullName(channelId)));
+    }
+
+    private async handlePublishChannelToggle(ctx: Context): Promise<void> {
+      const userId = ctx.from?.id;
+      const callbackData = ctx.callbackQuery && 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : undefined;
+      if (!userId || !callbackData) return;
+
+      const channelId = callbackData.replace('publish_toggle_', '');
+      const session = this.userSessions.get(userId) || await database.getUserSession(userId);
+      const availableChannels = await this.getAvailableChannels(userId);
+      if (!session || session.mode !== BotMode.Publish || !availableChannels.includes(channelId)) {
+        await ctx.answerCbQuery('频道选择已失效，请重新进入发布模式。', { show_alert: true }).catch(() => {});
+        return;
+      }
+
+      const selected = new Set(this.getSelectedChannels(session));
+      const isAdding = !selected.has(channelId);
+      if (isAdding) selected.add(channelId);
+      else selected.delete(channelId);
+
+      session.selectedChannels = Array.from(selected);
+      session.selectedChannel = session.selectedChannels[0];
+      session.step = 'selecting_channel';
+      this.userSessions.set(userId, session);
+      await database.saveUserSession(userId, session);
+      await ctx.answerCbQuery(isAdding ? '已选中' : '已取消').catch(() => {});
+
+      const selectedNames = await this.getSelectedChannelNames(session.selectedChannels);
+      const text = `🚀 发布内容\n\n请选择一个或多个目标群/频道：\n\n` +
+        (selectedNames.length ? `已选择（${selectedNames.length}）：\n${selectedNames.map(name => `• ${name}`).join('\n')}` : '暂未选择目标。');
+      try {
+        await ctx.editMessageText(text, await this.getChannelSelectionKeyboard(userId, session.selectedChannels));
+      } catch {
+        await ctx.reply(text, await this.getChannelSelectionKeyboard(userId, session.selectedChannels));
+      }
+    }
+
+    private async handlePublishChannelsConfirm(ctx: Context): Promise<void> {
+      const userId = ctx.from?.id;
+      if (!userId) return;
+      const session = this.userSessions.get(userId) || await database.getUserSession(userId);
+      if (!session || session.mode !== BotMode.Publish) return;
+
+      const selectedChannels = this.getSelectedChannels(session);
+      if (selectedChannels.length === 0) {
+        await ctx.answerCbQuery('请至少选择一个群或频道。', { show_alert: true }).catch(() => {});
+        return;
+      }
+      session.selectedChannels = selectedChannels;
+      session.selectedChannel = selectedChannels[0];
+      session.step = 'waiting_keyword';
+      this.userSessions.set(userId, session);
+      await database.saveUserSession(userId, session);
+      await ctx.answerCbQuery('目标已确认').catch(() => {});
+
+      const names = await this.getSelectedChannelNames(selectedChannels);
+      await ctx.editMessageText(`📢 发布模式激活\n\n` +
+        `已选择 ${names.length} 个目标：\n${names.map(name => `• ${name}`).join('\n')}\n\n` +
+        `💡 请输入要发布的关键词：\n` +
+        `• 单个：优米\n` +
+        `• 多个连写：优米樊樊\n` +
+        `• 或多个空格：优米 樊樊 北北\n` +
+        `会按顺序同步发到所有已选目标。\n\n` +
+        `🔄 发布模式将保持激活，可连续发布`, Markup.inlineKeyboard([
+          [Markup.button.callback('❌ 退出发布模式', 'cancel')]
+        ])).catch(async () => {
+          await ctx.reply('✅ 目标已确认，请直接输入要发布的关键词。');
+        });
+    }
+
+    private async handleUploadChannelToggle(ctx: Context): Promise<void> {
+      const userId = ctx.from?.id;
+      const callbackData = ctx.callbackQuery && 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : undefined;
+      if (!userId || !callbackData) return;
+      const channelId = callbackData.replace('upload_toggle_', '');
+      const session = await UploadHandler.resolveUploadSession(userId, this.userSessions, database);
+      const availableChannels = await this.getAvailableChannels(userId);
+      if (!session || !session.pendingMedia?.length || !availableChannels.includes(channelId)) {
+        await ctx.answerCbQuery('上传会话已失效，请重新选择频道。', { show_alert: true }).catch(() => {});
+        return;
+      }
+
+      const selected = new Set(this.getSelectedChannels(session));
+      const isAdding = !selected.has(channelId);
+      if (isAdding) selected.add(channelId);
+      else selected.delete(channelId);
+      session.selectedChannels = Array.from(selected);
+      session.selectedChannel = session.selectedChannels[0];
+      session.step = 'selecting_channel';
+      this.userSessions.set(userId, session);
+      await database.saveUserSession(userId, session);
+      await ctx.answerCbQuery(isAdding ? '已选中' : '已取消').catch(() => {});
+      await UploadHandler.renderChannelSelection(ctx, this.userSessions, this.bot, true);
+    }
+
+    private async handleUploadChannelsConfirm(ctx: Context): Promise<void> {
+      const userId = ctx.from?.id;
+      if (!userId) return;
+      const session = await UploadHandler.resolveUploadSession(userId, this.userSessions, database);
+      if (!session || !session.pendingMedia?.length) return;
+      const selectedChannels = this.getSelectedChannels(session);
+      if (selectedChannels.length === 0) {
+        await ctx.answerCbQuery('请至少选择一个群或频道。', { show_alert: true }).catch(() => {});
+        return;
+      }
+      session.selectedChannels = selectedChannels;
+      session.selectedChannel = selectedChannels[0];
+      session.step = 'confirming';
+      this.userSessions.set(userId, session);
+      await database.saveUserSession(userId, session);
+      await ctx.answerCbQuery('目标已确认').catch(() => {});
+
+      const names = await this.getSelectedChannelNames(selectedChannels);
+      const text = `📤 上传确认\n\n关键词: "${session.currentKeyword}"\n` +
+        `目标群/频道（${names.length}）：\n${names.map(name => `• ${name}`).join('\n')}\n` +
+        `媒体文件: ${session.pendingMedia.length} 个\n\n请选择操作：`;
+      try {
+        await ctx.editMessageText(text, this.getUploadConfirmKeyboard());
+      } catch {
+        await ctx.reply(text, this.getUploadConfirmKeyboard());
+      }
+    }
+
     async handleChannelSelect(ctx: Context) {
     const userId = ctx.from?.id;
         if (!userId)
@@ -1192,6 +1345,7 @@ export class TelegramBot {
         if (!session)
             return;
     session.selectedChannel = channelId;
+    session.selectedChannels = [channelId];
     session.step = 'waiting_keyword';
     this.userSessions.set(userId, session);
     await database.saveUserSession(userId, session);
@@ -2014,23 +2168,10 @@ export class TelegramBot {
     try {
       // 获取被回复消息的ID
       const repliedMessageId = ctx.message.reply_to_message.message_id;
-      // 从消息ID映射中获取目标用户ID
-      const targetUserId = this.adminMessageToUserMap.get(repliedMessageId);
-            let finalTargetUserId;
-      if (targetUserId) {
-        finalTargetUserId = targetUserId;
-            }
-            else {
-        // 尝试从消息文本中提取用户ID（备用方案）
-        const replyMessage = ctx.message.reply_to_message;
-        const messageText = ('caption' in replyMessage) ? replyMessage.caption || '' : 
-                           ('text' in replyMessage) ? replyMessage.text || '' : '';
-        const userIdMatch = messageText.match(/ID: (\d+)/);
-        if (!userIdMatch) {
-          await ctx.reply('❌ 无法识别回复目标用户，请确认回复的是用户消息');
-          return;
-        }
-        finalTargetUserId = parseInt(userIdMatch[1]);
+      const finalTargetUserId = this.getAdminReplyTargetUserId(ctx);
+      if (!finalTargetUserId) {
+        await ctx.reply('❌ 无法识别回复目标用户，请引用用户转发消息或“新的聊天请求”通知。');
+        return;
       }
       // 获取媒体文件ID和说明文字
             let fileId;
@@ -2088,9 +2229,7 @@ export class TelegramBot {
         
         await ctx.reply(`✅ ${this.getMediaTypeName(mediaType)}已发送给用户 ${finalTargetUserId}`);
         // 清理已使用的消息映射
-        if (targetUserId) {
-          this.adminMessageToUserMap.delete(repliedMessageId);
-        }
+        this.adminMessageToUserMap.delete(repliedMessageId);
       }
       catch (error) {
         await ctx.reply(`❌ 发送失败，用户 ${finalTargetUserId} 可能已停止机器人`);
@@ -2187,16 +2326,23 @@ export class TelegramBot {
     buttons.push([Markup.button.callback(BUTTONS.BACK_TO_MAIN, 'back_to_main')]);
     return Markup.inlineKeyboard(buttons);
   }
-    async getChannelSelectionKeyboard(userId: number) {
+    async getChannelSelectionKeyboard(userId: number, selectedChannelIds: string[] = []) {
         // 子管理员有独立映射时只用映射；超管/默认：env CHANNEL_IDS ∪ 频道管理里动态添加的
         const managedChannels = hasAdminChannelMap(userId)
           ? getAdminChannelIds(userId)
           : await database.getManagedChannels();
+        const selected = new Set(selectedChannelIds.map(String));
         const buttons = await Promise.all(
           managedChannels.map(async (channelId: string) => [
-            Markup.button.callback(await this.getChannelFullName(channelId), `channel_${channelId}`)
+            Markup.button.callback(
+              `${selected.has(String(channelId)) ? '✅ ' : '☐ '}${await this.getChannelFullName(channelId)}`,
+              `publish_toggle_${channelId}`
+            )
           ])
         );
+        if (selected.size > 0) {
+          buttons.push([Markup.button.callback(`✅ 确认 ${selected.size} 个目标`, 'publish_channels_confirm')]);
+        }
         buttons.push([Markup.button.callback(BUTTONS.BACK_TO_MAIN, 'back_to_main')]);
         return Markup.inlineKeyboard(buttons);
   }
