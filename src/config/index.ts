@@ -17,33 +17,6 @@ export const config: BotConfig = {
   persistentGroupId: process.env.PERSISTENT_GROUP_ID
 };
 
-/** 本地 Android 执行端访问队列时使用。生产环境必须配置为随机长字符串。 */
-export const androidWorkerToken = process.env.ANDROID_WORKER_TOKEN || '';
-export const androidTaskLeaseMs = Math.max(30_000, parseInt(process.env.ANDROID_TASK_LEASE_MS || '120000', 10) || 120000);
-
-const positiveInt = (raw: string | undefined, fallback: number, minimum = 0): number => {
-  const value = parseInt(raw || '', 10);
-  return Number.isFinite(value) && value >= minimum ? value : fallback;
-};
-
-/**
- * 节流保护：连续私信是第三方 App 风控最敏感的行为。
- * 两次真实发送之间取 [min,max] 的随机间隔，并限制每日发送次数（0 表示不限）。
- */
-const androidSendMinIntervalMs = positiveInt(process.env.ANDROID_SEND_MIN_INTERVAL_MS, 20_000);
-export const androidSendGuard = {
-  minIntervalMs: androidSendMinIntervalMs,
-  maxIntervalMs: Math.max(androidSendMinIntervalMs, positiveInt(process.env.ANDROID_SEND_MAX_INTERVAL_MS, 45_000)),
-  dailyLimit: positiveInt(process.env.ANDROID_DAILY_SEND_LIMIT, 30)
-};
-
-/**
- * 上传资料后是否自动排队"同步到 App 笔记"。
- * 只有配了执行端 Token 的部署才会用到，所以默认跟随它开启；设 ANDROID_NOTE_SYNC=false 可单独关掉。
- */
-export const androidNoteSyncEnabled =
-  !!androidWorkerToken && (process.env.ANDROID_NOTE_SYNC || '').toLowerCase() !== 'false';
-
 if (!config.botToken) {
   console.warn('⚠️ 未配置 BOT_TOKEN，请在 .env 中填写后再启动');
 }

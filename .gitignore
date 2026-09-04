@@ -6,7 +6,6 @@
 env
 .env
 *.env
-android-worker.config.json
 
 # 数据目录（包含用户数据和媒体）
 data/
@@ -91,8 +90,3 @@ DEPLOYMENT.md
 迁移旧数据.sh
 README_部署包.md
 README_DOCKER.md
-
-# 草稿 / 素材文案，不进仓库
-文案.txt
-新建文本文档.txt
-session_*.txt

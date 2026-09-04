@@ -13,114 +13,6 @@ interface UserInfo {
   album_auth_expires?: string; // 🚀 新增：相册授权到期时间
 }
 
-export type AndroidSendTaskStatus = 'pending' | 'running' | 'succeeded' | 'failed';
-export type AndroidSendAction = 1 | 2 | 3 | 4;
-
-export interface AndroidAppUser {
-  appUserId: string;
-  appUserName: string;
-  remark?: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface AndroidAppContent {
-  contentId: string;
-  tgKeyword: string;
-  appContentIdentifier: string;
-  appContentPosition?: string;
-  remark?: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-/**
- * send：把已绑定内容私信给某个 App 用户。
- * noteSync：把 TG 素材同步成 App 里的一条笔记，操作自己的账号，因此不占发送配额也不受发送冷却限制。
- */
-export type AndroidTaskKind = 'send' | 'noteSync';
-
-export interface AndroidNoteSyncFile {
-  fileId: string;
-  fileType: 'photo' | 'video';
-}
-
-export interface AndroidNoteSyncPayload {
-  tgKeyword: string;
-  caption?: string;
-  files: AndroidNoteSyncFile[];
-}
-
-export interface AndroidSendTask {
-  taskId: string;
-  /** 老数据没有这个字段，读到 undefined 一律按 send 处理。 */
-  kind?: AndroidTaskKind;
-  /** 仅 kind='noteSync' 时存在。 */
-  noteSync?: AndroidNoteSyncPayload;
-  appUserId: string;
-  appUserName: string;
-  tgKeyword: string;
-  contentId: string;
-  appContentIdentifier: string;
-  appContentPosition?: string;
-  /** 1=笔记，2=展示，3=位置，4=三连 */
-  fromCircle?: boolean;
-  /** 圈子线索原文，Worker 用它在圈子里定位同一张卡片。 */
-  circleContent?: string;
-  action: AndroidSendAction;
-  status: AndroidSendTaskStatus;
-  requestedByChatId: number;
-  createdAt: string;
-  startedAt?: string;
-  completedAt?: string;
-  errorMessage?: string;
-  workerId?: string;
-  claimToken?: string;
-  leaseUntil?: string;
-}
-
-/** 节流保护参数：由 config 传入，数据层只负责按规则放行或拦截。 */
-export interface AndroidSendGuardOptions {
-  leaseMs: number;
-  dailyLimit: number;
-  minIntervalMs: number;
-  maxIntervalMs: number;
-}
-
-export type AndroidClaimHoldReason = 'worker-busy' | 'daily-limit' | 'cooldown';
-
-/** 队列没有放行任务时，说明原因和建议的重试间隔，避免执行端空转轮询。 */
-export interface AndroidClaimHold {
-  reason: AndroidClaimHoldReason;
-  message: string;
-  retryAfterMs: number;
-}
-
-export interface AndroidClaimResult {
-  task: AndroidSendTask | null;
-  hold?: AndroidClaimHold;
-}
-
-export interface AndroidSendQuota {
-  usedToday: number;
-  dailyLimit: number;
-  remainingToday: number;
-  pending: number;
-  running: number;
-  cooldownUntil?: string;
-}
-
-/** 圈子扫描结果：仅作为管理员确认发送对象的线索，不自动创建发送任务。 */
-export interface AndroidCircleLead {
-  leadId: string;
-  appUserId: string;
-  appUserName: string;
-  circleContent: string;
-  capturedAt: string;
-  botChatId?: number;
-  botMessageId?: number;
-}
-
 interface DatabaseData {
   media: MediaItem[];
   userPermissions: UserPermission[];
@@ -130,14 +22,6 @@ interface DatabaseData {
   channels?: string[]; // 新增：动态添加的频道ID
   albums?: { [albumId: string]: any }; // 新增：存储生成的相册数据
   recommendedTags?: string[]; // 新增：推荐标签
-  androidAppUsers?: AndroidAppUser[];
-  androidAppContents?: AndroidAppContent[];
-  androidSendTasks?: AndroidSendTask[];
-  androidCircleLeads?: AndroidCircleLead[];
-  /** 上一次发送完成后算出的放行时间，重启后依然生效。 */
-  androidSendCooldownUntil?: string;
-  /** 管理员在面板里切换的运行时开关；未设置时用各自的默认值。 */
-  androidSettings?: { noteSyncOnUpload?: boolean };
 }
 
 export class JsonDatabase {
@@ -146,11 +30,7 @@ export class JsonDatabase {
     media: [],
     userPermissions: [],
     userSessions: {},
-    users: [], // 新增
-    androidAppUsers: [],
-    androidAppContents: [],
-    androidSendTasks: [],
-    androidCircleLeads: []
+    users: [] // 新增
   };
 
   constructor() {
@@ -189,11 +69,7 @@ export class JsonDatabase {
           joinWelcomeConfig: loadedData.joinWelcomeConfig || undefined,
           channels: Array.isArray(loadedData.channels) ? loadedData.channels : [],
           albums: this.normalizeObjectMap(loadedData.albums),
-          recommendedTags: loadedData.recommendedTags || ['W⬆️', '5⬆️', '静安', '黄浦', 'VIP'],
-          androidAppUsers: Array.isArray(loadedData.androidAppUsers) ? loadedData.androidAppUsers : [],
-          androidAppContents: Array.isArray(loadedData.androidAppContents) ? loadedData.androidAppContents : [],
-          androidSendTasks: Array.isArray(loadedData.androidSendTasks) ? loadedData.androidSendTasks : [],
-          androidCircleLeads: Array.isArray(loadedData.androidCircleLeads) ? loadedData.androidCircleLeads : []
+          recommendedTags: loadedData.recommendedTags || ['W⬆️', '5⬆️', '静安', '黄浦', 'VIP']
         };
 
         // 主库 media 空但有 fallback 时自动恢复（保存失败过的场景）
@@ -230,11 +106,7 @@ export class JsonDatabase {
           users: [],
           joinWelcomeConfig: undefined,
           channels: [],
-          albums: {},
-          androidAppUsers: [],
-          androidAppContents: [],
-          androidSendTasks: [],
-          androidCircleLeads: []
+          albums: {}
         };
         this.saveData();
         console.log('✅ 创建新的JSON数据库');
@@ -247,12 +119,8 @@ export class JsonDatabase {
         userSessions: {},
         users: [],
         joinWelcomeConfig: undefined,
-          channels: [],
-          albums: {},
-          androidAppUsers: [],
-          androidAppContents: [],
-          androidSendTasks: [],
-          androidCircleLeads: []
+        channels: [],
+        albums: {}
       };
     }
   }
@@ -300,11 +168,7 @@ export class JsonDatabase {
       joinWelcomeConfig: this.data.joinWelcomeConfig,
       channels: Array.isArray(this.data.channels) ? this.data.channels : [],
       albums,
-      recommendedTags: this.data.recommendedTags || [],
-      androidAppUsers: this.data.androidAppUsers || [],
-      androidAppContents: this.data.androidAppContents || [],
-      androidSendTasks: this.data.androidSendTasks || [],
-      androidCircleLeads: this.data.androidCircleLeads || []
+      recommendedTags: this.data.recommendedTags || []
     };
     return JSON.stringify(payload);
   }
@@ -1108,348 +972,6 @@ export class JsonDatabase {
     if (!this.data.albums) return [];
     return Object.values(this.data.albums)
       .sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-  }
-
-  // Android 自动发送：人工映射与 FIFO 任务队列
-  async upsertAndroidAppUser(input: Omit<AndroidAppUser, 'createdAt' | 'updatedAt'>): Promise<AndroidAppUser> {
-    const now = new Date().toISOString();
-    const rows = this.data.androidAppUsers || (this.data.androidAppUsers = []);
-    const index = rows.findIndex(item => item.appUserId === input.appUserId);
-    const value: AndroidAppUser = {
-      ...input,
-      createdAt: index >= 0 ? rows[index].createdAt : now,
-      updatedAt: now
-    };
-    if (index >= 0) rows[index] = value;
-    else rows.push(value);
-    await this.saveImmediately();
-    return value;
-  }
-
-  async upsertAndroidAppContent(input: Omit<AndroidAppContent, 'createdAt' | 'updatedAt'>): Promise<AndroidAppContent> {
-    const now = new Date().toISOString();
-    const rows = this.data.androidAppContents || (this.data.androidAppContents = []);
-    const duplicateKeyword = rows.find(item => item.tgKeyword === input.tgKeyword && item.contentId !== input.contentId);
-    if (duplicateKeyword) throw new Error(`关键词「${input.tgKeyword}」已绑定内容 ${duplicateKeyword.contentId}`);
-    const index = rows.findIndex(item => item.contentId === input.contentId);
-    const value: AndroidAppContent = {
-      ...input,
-      createdAt: index >= 0 ? rows[index].createdAt : now,
-      updatedAt: now
-    };
-    if (index >= 0) rows[index] = value;
-    else rows.push(value);
-    await this.saveImmediately();
-    return value;
-  }
-
-  async getAndroidAppUser(appUserId: string): Promise<AndroidAppUser | null> {
-    return (this.data.androidAppUsers || []).find(item => item.appUserId === appUserId) || null;
-  }
-
-  async getAndroidAppContentByKeyword(tgKeyword: string): Promise<AndroidAppContent | null> {
-    return (this.data.androidAppContents || []).find(item => item.tgKeyword === tgKeyword) || null;
-  }
-
-  async listAndroidMappings(): Promise<{ users: AndroidAppUser[]; contents: AndroidAppContent[] }> {
-    return {
-      users: [...(this.data.androidAppUsers || [])].sort((a, b) => a.appUserId.localeCompare(b.appUserId)),
-      contents: [...(this.data.androidAppContents || [])].sort((a, b) => a.contentId.localeCompare(b.contentId))
-    };
-  }
-
-  async createAndroidSendTasks(
-    appUser: AndroidAppUser,
-    contents: AndroidAppContent[],
-    requestedByChatId: number,
-    action: AndroidSendAction = 1,
-    extras?: { fromCircle?: boolean; circleContent?: string }
-  ): Promise<AndroidSendTask[]> {
-    const rows = this.data.androidSendTasks || (this.data.androidSendTasks = []);
-    const now = new Date().toISOString();
-    const tasks = contents.map((content, index): AndroidSendTask => ({
-      taskId: `ast_${Date.now().toString(36)}_${index}_${Math.random().toString(36).slice(2, 8)}`,
-      appUserId: appUser.appUserId,
-      appUserName: appUser.appUserName,
-      tgKeyword: content.tgKeyword,
-      contentId: content.contentId,
-      appContentIdentifier: content.appContentIdentifier,
-      appContentPosition: content.appContentPosition,
-      action,
-      fromCircle: extras?.fromCircle,
-      circleContent: extras?.circleContent,
-      status: 'pending',
-      requestedByChatId,
-      createdAt: now
-    }));
-    rows.push(...tasks);
-    await this.saveImmediately();
-    return tasks;
-  }
-
-  /**
-   * 当天已经真正私信过的任务数：只要领取过就计数，失败的那次也已经动过手机。
-   * 同步笔记只操作自己的账号，不算在私信配额里。
-   */
-  private countAndroidSendAttemptsToday(): number {
-    const today = new Date().toLocaleDateString('sv-SE');
-    return (this.data.androidSendTasks || []).filter(
-      task =>
-        (task.kind || 'send') === 'send' &&
-        task.startedAt &&
-        new Date(task.startedAt).toLocaleDateString('sv-SE') === today
-    ).length;
-  }
-
-  /**
-   * 把一批 TG 素材排成一条"同步笔记"任务。
-   * 和发送任务共用同一条队列，因为它们抢的是同一台手机。
-   */
-  async createAndroidNoteSyncTask(
-    payload: AndroidNoteSyncPayload,
-    requestedByChatId: number
-  ): Promise<AndroidSendTask> {
-    const rows = this.data.androidSendTasks || (this.data.androidSendTasks = []);
-    const now = new Date().toISOString();
-    const task: AndroidSendTask = {
-      taskId: `ans_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-      kind: 'noteSync',
-      noteSync: payload,
-      // 下面几个字段是发送任务的形状，这里填成可读的占位值，好让任务列表统一展示。
-      appUserId: 'self',
-      appUserName: '本机账号',
-      tgKeyword: payload.tgKeyword,
-      contentId: 'note-sync',
-      appContentIdentifier: payload.tgKeyword,
-      action: 1,
-      status: 'pending',
-      requestedByChatId,
-      createdAt: now
-    };
-    rows.push(task);
-    await this.saveImmediately();
-    return { ...task };
-  }
-
-  async getAndroidNoteSyncOnUpload(defaultValue: boolean): Promise<boolean> {
-    return this.data.androidSettings?.noteSyncOnUpload ?? defaultValue;
-  }
-
-  async setAndroidNoteSyncOnUpload(value: boolean): Promise<void> {
-    const settings = this.data.androidSettings || (this.data.androidSettings = {});
-    settings.noteSyncOnUpload = value;
-    await this.saveImmediately();
-  }
-
-  async getAndroidSendQuota(dailyLimit: number): Promise<AndroidSendQuota> {
-    const rows = this.data.androidSendTasks || [];
-    const usedToday = this.countAndroidSendAttemptsToday();
-    return {
-      usedToday,
-      dailyLimit,
-      remainingToday: dailyLimit > 0 ? Math.max(0, dailyLimit - usedToday) : Number.POSITIVE_INFINITY,
-      pending: rows.filter(task => task.status === 'pending').length,
-      running: rows.filter(task => task.status === 'running').length,
-      cooldownUntil: this.data.androidSendCooldownUntil
-    };
-  }
-
-  async claimNextAndroidSendTask(workerId: string, options: AndroidSendGuardOptions): Promise<AndroidClaimResult> {
-    const rows = this.data.androidSendTasks || [];
-    const now = new Date();
-    let changed = false;
-    for (const task of rows) {
-      if (task.status === 'running' && task.leaseUntil && new Date(task.leaseUntil).getTime() <= now.getTime()) {
-        task.status = 'pending';
-        task.errorMessage = '执行端租约超时，已重新进入队列';
-        task.workerId = undefined;
-        task.claimToken = undefined;
-        task.leaseUntil = undefined;
-        changed = true;
-      }
-    }
-
-    const persist = async (): Promise<void> => {
-      if (changed) await this.saveImmediately();
-    };
-
-    // 需求 §8：同一时刻只允许一个任务在操作 App，多个执行端也不能各领一条并行跑。
-    const running = rows.find(task => task.status === 'running');
-    if (running && running.workerId === workerId) {
-      // 同一台电脑 Ctrl+C 后再启动：把未完成的任务交回给它，避免空等租约 5 分钟。
-      running.status = 'pending';
-      running.errorMessage = '执行端已重连，任务重新入队';
-      running.workerId = undefined;
-      running.claimToken = undefined;
-      running.leaseUntil = undefined;
-      changed = true;
-    } else if (running) {
-      await persist();
-      const remainingMs = running.leaseUntil ? new Date(running.leaseUntil).getTime() - now.getTime() : 30_000;
-      return {
-        task: null,
-        hold: {
-          reason: 'worker-busy',
-          message: `任务 ${running.taskId} 正在由 ${running.workerId || '其他执行端'} 处理，队列串行执行。`,
-          retryAfterMs: Math.min(Math.max(remainingMs, 3000), 30_000)
-        }
-      };
-    }
-
-    const pending = rows
-      .filter(task => task.status === 'pending')
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-    if (!pending.length) {
-      await persist();
-      return { task: null };
-    }
-
-    // 同步笔记只动自己的账号，不受私信节流约束；发送冷却期正好可以拿来建笔记。
-    const noteSync = pending.find(task => task.kind === 'noteSync');
-    if (noteSync) {
-      noteSync.status = 'running';
-      noteSync.startedAt = now.toISOString();
-      noteSync.workerId = workerId;
-      noteSync.claimToken = `claim_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
-      noteSync.leaseUntil = new Date(now.getTime() + options.leaseMs).toISOString();
-      await this.saveImmediately();
-      return { task: { ...noteSync } };
-    }
-
-    const next = pending[0];
-
-    if (options.dailyLimit > 0) {
-      const usedToday = this.countAndroidSendAttemptsToday();
-      if (usedToday >= options.dailyLimit) {
-        await persist();
-        const tomorrow = new Date(now);
-        tomorrow.setHours(24, 0, 0, 0);
-        return {
-          task: null,
-          hold: {
-            reason: 'daily-limit',
-            message: `今日已发送 ${usedToday}/${options.dailyLimit} 条，达到上限，剩余任务顺延到明天。`,
-            retryAfterMs: Math.min(tomorrow.getTime() - now.getTime(), 15 * 60_000)
-          }
-        };
-      }
-    }
-
-    const cooldownUntil = this.data.androidSendCooldownUntil
-      ? new Date(this.data.androidSendCooldownUntil).getTime()
-      : 0;
-    if (cooldownUntil > now.getTime()) {
-      await persist();
-      return {
-        task: null,
-        hold: {
-          reason: 'cooldown',
-          message: `节流保护：距离下一条发送还有 ${Math.ceil((cooldownUntil - now.getTime()) / 1000)} 秒。`,
-          retryAfterMs: cooldownUntil - now.getTime()
-        }
-      };
-    }
-
-    next.status = 'running';
-    next.startedAt = now.toISOString();
-    next.workerId = workerId;
-    next.claimToken = `claim_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
-    next.leaseUntil = new Date(now.getTime() + options.leaseMs).toISOString();
-    await this.saveImmediately();
-    return { task: { ...next } };
-  }
-
-  async completeAndroidSendTask(
-    taskId: string,
-    workerId: string,
-    claimToken: string,
-    success: boolean,
-    errorMessage?: string,
-    cooldown?: { minIntervalMs: number; maxIntervalMs: number }
-  ): Promise<AndroidSendTask> {
-    const task = (this.data.androidSendTasks || []).find(item => item.taskId === taskId);
-    if (!task) throw new Error('任务不存在');
-    if (task.status !== 'running' || task.workerId !== workerId || task.claimToken !== claimToken) {
-      throw new Error('任务未由当前执行端领取，或租约已失效');
-    }
-    task.status = success ? 'succeeded' : 'failed';
-    task.completedAt = new Date().toISOString();
-    task.errorMessage = success ? undefined : (errorMessage || 'Android 执行失败');
-    task.leaseUntil = undefined;
-    // 间隔一次算定并存下来，避免每次轮询重新随机导致冷却时间忽长忽短。
-    // 同步笔记没有私信行为，不该顺延下一条真实发送的时间。
-    if ((task.kind || 'send') === 'send' && success && cooldown && cooldown.minIntervalMs > 0) {
-      const span = Math.max(0, cooldown.maxIntervalMs - cooldown.minIntervalMs);
-      const delay = cooldown.minIntervalMs + Math.floor(Math.random() * (span + 1));
-      this.data.androidSendCooldownUntil = new Date(Date.now() + delay).toISOString();
-    }
-    await this.saveImmediately();
-    return { ...task };
-  }
-
-  async listAndroidSendTasks(limit: number = 20): Promise<AndroidSendTask[]> {
-    return [...(this.data.androidSendTasks || [])]
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-      .slice(0, Math.max(1, Math.min(limit, 100)));
-  }
-
-  async saveAndroidCircleLead(input: Omit<AndroidCircleLead, 'leadId' | 'capturedAt' | 'botChatId' | 'botMessageId'>): Promise<{ lead: AndroidCircleLead; isNew: boolean }> {
-    const rows = this.data.androidCircleLeads || (this.data.androidCircleLeads = []);
-    const now = new Date().toISOString();
-    const existing = rows.find(item => item.appUserId === input.appUserId && item.circleContent === input.circleContent);
-    if (existing) return { lead: { ...existing }, isNew: false };
-    const lead: AndroidCircleLead = {
-      leadId: `acl_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-      ...input,
-      capturedAt: now
-    };
-    rows.push(lead);
-    // 仅保留最近 2,000 条，避免长时间扫描无限增长。
-    if (rows.length > 2000) rows.splice(0, rows.length - 2000);
-    await this.saveImmediately();
-    return { lead: { ...lead }, isNew: true };
-  }
-
-  async bindAndroidCircleLeadToBotMessage(leadId: string, botChatId: number, botMessageId: number): Promise<void> {
-    const lead = (this.data.androidCircleLeads || []).find(item => item.leadId === leadId);
-    if (!lead) throw new Error('圈子线索不存在');
-    lead.botChatId = botChatId;
-    lead.botMessageId = botMessageId;
-    await this.saveImmediately();
-  }
-
-  async getAndroidCircleLeadByBotMessage(botChatId: number, botMessageId: number): Promise<AndroidCircleLead | null> {
-    return (this.data.androidCircleLeads || []).find(item => item.botChatId === botChatId && item.botMessageId === botMessageId) || null;
-  }
-
-  async getAndroidCircleLead(leadId: string): Promise<AndroidCircleLead | null> {
-    return (this.data.androidCircleLeads || []).find(item => item.leadId === leadId) || null;
-  }
-
-  async listAndroidCircleLeads(limit = 20): Promise<AndroidCircleLead[]> {
-    return [...(this.data.androidCircleLeads || [])]
-      .sort((a, b) => b.capturedAt.localeCompare(a.capturedAt))
-      .slice(0, limit);
-  }
-
-  async createAndroidSendTasksForCircleLead(
-    leadId: string,
-    contents: AndroidAppContent[],
-    requestedByChatId: number,
-    action: AndroidSendAction
-  ): Promise<AndroidSendTask[]> {
-    const lead = (this.data.androidCircleLeads || []).find(item => item.leadId === leadId);
-    if (!lead) throw new Error('圈子线索不存在');
-    const appUser: AndroidAppUser = {
-      appUserId: lead.appUserId,
-      appUserName: lead.appUserName,
-      createdAt: lead.capturedAt,
-      updatedAt: lead.capturedAt
-    };
-    return this.createAndroidSendTasks(appUser, contents, requestedByChatId, action, {
-      fromCircle: true,
-      circleContent: lead.circleContent
-    });
   }
 
   async close(): Promise<void> {

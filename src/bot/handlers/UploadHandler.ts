@@ -1,8 +1,7 @@
 import { Context, Telegraf } from 'telegraf';
 import { database } from '../../database';
 import { UserSession, MediaItem, BotMode } from '../../types';
-import { androidNoteSyncEnabled, config, getAdminChannelIds, getAdminPersistentChannelId, hasAdminChannelMap } from '../../config';
-import { queueNoteSyncTasksForItems } from '../../androidSend/noteSync';
+import { config, getAdminChannelIds, getAdminPersistentChannelId, hasAdminChannelMap } from '../../config';
 import { recordPublishEvent } from '../../services/publishAudit';
 import { checkVaultAccess } from '../../services/vault';
 
@@ -550,11 +549,6 @@ export class UploadHandler {
         this.broadcastReviewUpdate(ctx.telegram, db);
       }
 
-      // 好评图不进笔记库，只有正式资料才同步。
-      const noteSyncCount = isReviewMode
-        ? 0
-        : await this.queueNoteSyncTasks(savedItems, session.currentKeyword, ctx.chat?.id, db);
-
       const groupCount = this.countBatches(savedItems);
       let completionText: string;
       if (isReviewMode) {
@@ -574,10 +568,6 @@ export class UploadHandler {
           `👉 把【当前这个】bot 加成备份频道管理员后，再上传一次或跑 vault:sync。`;
       }
       
-      if (noteSyncCount > 0) {
-        completionText += `\n\n📱 已排队 ${noteSyncCount} 条 App 笔记同步，手机执行完会单独回执。`;
-      }
-
       const completionKeyboard = { inline_keyboard: [[{ text: '🏠 返回主菜单', callback_data: 'back_to_main' }]] };
 
       try {
@@ -590,21 +580,6 @@ export class UploadHandler {
       console.error('保存媒体错误:', error);
       await ctx.reply(`❌ 保存时发生错误：${error?.message || '请稍后重试'}`);
     }
-  }
-
-  /**
-   * 上传保存后的自动同步。除了环境开关，还要看管理员在 Android 面板里的运行时开关。
-   */
-  private static async queueNoteSyncTasks(
-    savedItems: MediaItem[],
-    keyword: string,
-    chatId: number | undefined,
-    db: typeof database
-  ): Promise<number> {
-    if (!androidNoteSyncEnabled || !chatId) return 0;
-    const autoSyncOn = await db.getAndroidNoteSyncOnUpload(true);
-    if (!autoSyncOn) return 0;
-    return queueNoteSyncTasksForItems(savedItems, keyword, chatId);
   }
 
   static async handleSaveAndPublish(

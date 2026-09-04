@@ -15,8 +15,6 @@ import { ForwardingService } from '../forwarding';
 import { BroadcastDataHandler } from './handlers/BroadcastDataHandler';
 import { ReviewHandler } from './handlers/ReviewHandler';
 import { getVaultCoverageStats, checkVaultAccess } from '../services/vault';
-import { AndroidSendCommands } from '../androidSend/commands';
-import { AndroidPanel } from '../androidSend/panel';
 
 export class TelegramBot {
   private bot: Telegraf;
@@ -155,16 +153,6 @@ export class TelegramBot {
     this.bot.command('setforwarddelay', this.withAuthorization(this.handleSetForwardDelay.bind(this)));
     this.bot.command('showforwarddelay', this.withAuthorization(this.handleShowForwardDelay.bind(this)));
     this.bot.command('vaultstatus', this.withStrictAuthorization(this.handleVaultStatus.bind(this)));
-    // Android 自动发送（Telegram 只支持 ASCII 命令；中文别名在文本处理器中兜底）
-    this.bot.command('binduser', this.withStrictAuthorization(AndroidSendCommands.bindUser));
-    this.bot.command('bindcontent', this.withStrictAuthorization(AndroidSendCommands.bindContent));
-    this.bot.command('send', this.withStrictAuthorization(AndroidSendCommands.send));
-    this.bot.command('mappings', this.withStrictAuthorization(AndroidSendCommands.mappings));
-    this.bot.command('sendtasks', this.withStrictAuthorization(AndroidSendCommands.tasks));
-    // Android 控制台：按钮化面板，所有 as: 前缀的回调统一走 AndroidPanel 分发。
-    this.bot.command('notesync', this.withStrictAuthorization(AndroidSendCommands.syncNotes));
-    this.bot.command('android', this.withStrictAuthorization(AndroidPanel.open.bind(AndroidPanel)));
-    this.bot.action(/^as:/, this.withStrictAuthorization(AndroidPanel.handleCallback.bind(AndroidPanel)));
     // ========== 账号控制功能（新增） ==========
     this.bot.command('account', this.withStrictAuthorization(this.handleAccountMenu.bind(this)));
     this.bot.hears('🎛️ 账号控制', this.withStrictAuthorization(this.handleAccountMenu.bind(this)));
@@ -514,10 +502,6 @@ export class TelegramBot {
                 Markup.button.callback('🚀 发布内容', 'start_publish'),
                 Markup.button.callback('🖼️ 网页相册', 'start_album_maker')
       ]);
-            // Android 真机控制台（发送笔记 / 同步资料）
-            inlineKeyboard.push([
-              Markup.button.callback('🤖 Android 控制台', 'as:menu')
-            ]);
             if (isRootAdmin) {
               // 第三行 - 管理功能（仅超级管理员）
               inlineKeyboard.push([
@@ -1328,35 +1312,6 @@ export class TelegramBot {
             );
         } catch (error) {
             console.error('追踪用户失败:', error);
-        }
-
-        // 管理员引用 Bot 转发的圈子线索并回复“关键词 1..4”，才会创建发送任务。
-        if (this.isAdmin(userId) && await AndroidSendCommands.handleCircleLeadReply(ctx)) {
-          return;
-        }
-        if (this.isAdmin(userId) && await AndroidSendCommands.handleSyncText(ctx)) {
-          AndroidPanel.clearNoteSyncWait(userId);
-          return;
-        }
-        if (this.isAdmin(userId) && await AndroidPanel.handleTypedKeyword(ctx)) {
-          return;
-        }
-
-        // Telegram 不把中文识别为 command entity，因此在文本流显式支持需求文档中的中文命令。
-        const chineseCommand = text.trim().match(/^\/(发送|绑定用户|绑定内容|映射列表|发送任务|安卓|同步)(?:\s|$)/u)?.[1];
-        if (chineseCommand) {
-          if (!this.isAdmin(userId)) {
-            await ctx.reply('❌ 仅管理员可使用 Android 自动发送命令。');
-            return;
-          }
-          if (chineseCommand === '发送') await AndroidSendCommands.send(ctx);
-          if (chineseCommand === '绑定用户') await AndroidSendCommands.bindUser(ctx);
-          if (chineseCommand === '绑定内容') await AndroidSendCommands.bindContent(ctx);
-          if (chineseCommand === '映射列表') await AndroidSendCommands.mappings(ctx);
-          if (chineseCommand === '发送任务') await AndroidSendCommands.tasks(ctx);
-          if (chineseCommand === '安卓') await AndroidPanel.open(ctx);
-          if (chineseCommand === '同步') await AndroidSendCommands.syncNotes(ctx);
-          return;
         }
 
         // 提取发布关键词：最高优先级，避免掉进搜索模式
